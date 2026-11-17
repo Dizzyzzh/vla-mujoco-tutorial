@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot-mujoco-tutorial"
+version = "0.1"
+description = "LeRobot x MuJoCo tutorial for robot manipulation"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mujoco_env*"]
+exclude = ["scripts*", "notebooks*", "demo_data*"]
