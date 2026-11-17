@@ -55,7 +55,8 @@ class SimpleEnv:
         Reset the environment
         Move the robot to a initial position, set the object positions based on the seed
         '''
-        if seed != None: np.random.seed(seed=0) 
+        if seed is not None:
+            np.random.seed(seed)
         q_init = np.deg2rad([0,0,0,0,0,0])
         q_zero,ik_err_stack,ik_info = solve_ik(
             env = self.env,
@@ -141,7 +142,7 @@ class SimpleEnv:
             return self.get_joint_state()
         elif self.state_type == 'ee_pose':
             return self.get_ee_pose()
-        elif self.state_type == 'delta_q' or self.action_type == 'delta_joint_angle':
+        elif self.state_type == 'delta_q':
             dq =  self.get_delta_q()
             return dq
         else:
