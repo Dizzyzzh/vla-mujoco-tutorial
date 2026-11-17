@@ -1,80 +1,75 @@
 import numpy as np
+from datetime import datetime
 from PIL import Image
 from mujoco_env.y_env import SimpleEnv
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-SEED = 0 
+SEED = 0
 # SEED = None <- Uncomment this line to randomize the object positions
-REPO_NAME = 'omy_pnp'
-NUM_DEMO = 1 # Number of demonstrations to collect
-ROOT = "./demo_data" # The root directory to save the demonstrations
-TASK_NAME = 'Put mug cup on the plate' 
-xml_path = './asset/example_scene_y.xml'
+REPO_NAME = "omy_pnp"
+NUM_DEMO = 1  # Number of demonstrations to collect
+TASK_NAME = "Put mug cup on the plate"
+XML_PATH = "./asset/example_scene_y.xml"
+CREATE_NEW_DATASET = True  # Set to False if you want to load from a previous dataset
+OLD_DATASET_PATH = "./data/demo_data_20261117_161335"  # 旧数据集路径，如果 CREATE_NEW_DATASET = False，则会从该路径加载数据集
 
-# Define the environment
-PnPEnv = SimpleEnv(xml_path, seed = SEED, state_type = 'joint_angle')
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+ROOT = f"./data/demo_data_{timestamp}"
+print(f"Save dataset to: {ROOT}")
 
-create_new = True
-if os.path.exists(ROOT):
-    print(f"Directory {ROOT} already exists.")
-    ans = input("Do you want to delete it? (y/n) ")
-    if ans == 'y':
-        import shutil
-        shutil.rmtree(ROOT)
-    else:
-        create_new = False
-
-
-if create_new:
+if CREATE_NEW_DATASET:
     dataset = LeRobotDataset.create(
-                repo_id=REPO_NAME,
-                root = ROOT, 
-                robot_type="omy",
-                fps=20, # 20 frames per second
-                features={
-                    "observation.image": {
-                        "dtype": "image",
-                        "shape": (256, 256, 3),
-                        "names": ["height", "width", "channels"],
-                    },
-                    "observation.wrist_image": {
-                        "dtype": "image",
-                        "shape": (256, 256, 3),
-                        "names": ["height", "width", "channel"],
-                    },
-                    "observation.state": {
-                        "dtype": "float32",
-                        "shape": (6,),
-                        "names": ["state"], # x, y, z, roll, pitch, yaw
-                    },
-                    "action": {
-                        "dtype": "float32",
-                        "shape": (7,),
-                        "names": ["action"], # 6 joint angles and 1 gripper
-                    },
-                    "obj_init": {
-                        "dtype": "float32",
-                        "shape": (6,),
-                        "names": ["obj_init"], # just the initial position of the object. Not used in training.
-                    },
-                },
-                image_writer_threads=0,
-                image_writer_processes=0
-        )
+        repo_id=REPO_NAME,
+        root=ROOT,
+        robot_type="omy",
+        fps=20,  # 20 frames per second
+        features={
+            "observation.image": {
+                "dtype": "image",
+                "shape": (256, 256, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.wrist_image": {
+                "dtype": "image",
+                "shape": (256, 256, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (6,),
+                "names": ["state"],  # x, y, z, roll, pitch, yaw
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": ["action"],  # 6 joint angles and 1 gripper
+            },
+            "obj_init": {
+                "dtype": "float32",
+                "shape": (6,),
+                "names": [
+                    "obj_init"
+                ],  # just the initial position of the object. Not used in training.
+            },
+        },
+    )
 else:
     print("Load from previous dataset")
-    dataset = LeRobotDataset(REPO_NAME, root=ROOT)
+    dataset = LeRobotDataset(REPO_NAME, root=OLD_DATASET_PATH)
 
+
+# Define the environment
+PnPEnv = SimpleEnv(XML_PATH, seed=SEED)
 
 action = np.zeros(7)
 episode_id = 0
-record_flag = False # Start recording when the robot starts moving
+record_flag = False  # Start recording when the robot starts moving
 while PnPEnv.env.is_viewer_alive() and episode_id < NUM_DEMO:
     PnPEnv.step_env()
     if PnPEnv.env.loop_every(HZ=20):
         # check if the episode is done
         done = PnPEnv.check_success()
-        if done: 
+        if done:
             # Save the episode data and reset the environment
             dataset.save_episode()
             PnPEnv.reset(seed=SEED)
@@ -107,7 +102,7 @@ while PnPEnv.env.is_viewer_alive() and episode_id < NUM_DEMO:
                 frame = {
                     "observation.image": agent_image,
                     "observation.wrist_image": wrist_image,
-                    "observation.state": ee_pose, 
+                    "observation.state": ee_pose,
                     "action": joint_q,
                     "obj_init": PnPEnv.obj_init_pose,
                     "task": TASK_NAME,
@@ -116,9 +111,7 @@ while PnPEnv.env.is_viewer_alive() and episode_id < NUM_DEMO:
         PnPEnv.render(teleop=True)
 
 
-# 必须按顺序关闭两个 writer，确保 parquet footer 写入
-dataset.meta._close_writer()   # 关闭 episodes parquet writer（内部会先 flush）
-dataset._close_writer()         # 关闭 data parquet writer
-print('Dataset saved successfully.')
+dataset.finalize()
+print("Dataset saved successfully.")
 
 PnPEnv.env.close_viewer()
