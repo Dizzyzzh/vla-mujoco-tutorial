@@ -10,8 +10,8 @@ REPO_NAME = "omy_pnp"
 NUM_DEMO = 1  # Number of demonstrations to collect
 TASK_NAME = "Put mug cup on the plate"
 XML_PATH = "./asset/example_scene_y.xml"
-CREATE_NEW_DATASET = True  # Set to False if you want to load from a previous dataset
-OLD_DATASET_PATH = "./data/demo_data_20261117_161335"  # 旧数据集路径，如果 CREATE_NEW_DATASET = False，则会从该路径加载数据集
+CREATE_NEW_DATASET = True  # Set to False if you want to resume recording on an existing dataset
+OLD_DATASET_PATH = "./data/demo_data_20261117_161335"  # 旧数据集路径，如果 CREATE_NEW_DATASET = False，则会在此基础上继续追加 episode
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 ROOT = f"./data/demo_data_{timestamp}"
@@ -54,8 +54,11 @@ if CREATE_NEW_DATASET:
         },
     )
 else:
-    print("Load from previous dataset")
-    dataset = LeRobotDataset(REPO_NAME, root=OLD_DATASET_PATH)
+    print(f"Resume from previous dataset: {OLD_DATASET_PATH}")
+    dataset = LeRobotDataset.resume(
+        repo_id=REPO_NAME,
+        root=OLD_DATASET_PATH,
+    )
 
 
 # Define the environment
