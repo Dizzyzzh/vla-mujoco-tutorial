@@ -66,7 +66,6 @@ else:
 
 # Define the environment
 PnPEnv = SimpleEnv(XML_PATH, seed=SEED)
-
 action = np.zeros(7)
 episode_id = 0
 record_flag = False  # Start recording when the robot starts moving
@@ -90,9 +89,11 @@ try:
                 action = np.zeros(7)
             else:
                 action, reset = PnPEnv.teleop_robot()
+
                 if not record_flag and np.any(np.abs(action) > 1e-6):
                     record_flag = True
                     print("Start recording")
+                    
                 if reset:
                     # Press 'z' to reset the environment and clear the current episode buffer
                     PnPEnv.reset(seed=SEED)
