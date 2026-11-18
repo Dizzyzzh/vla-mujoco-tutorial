@@ -304,15 +304,30 @@ class SimpleEnv:
     def check_success(self):
         """
         ['body_obj_mug_5', 'body_obj_plate_11']
-        Check if the mug is placed on the plate
+        Check if the mug is stably standing upright on the plate
+        + Mug's local +z axis should stay aligned with world +z (i.e. not lying on its side)
+        + Mug should be at rest (small linear / angular velocity)
         + Gripper should be open and move upward above 0.9
         """
         p_mug = self.env.get_p_body("body_obj_mug_5")
         p_plate = self.env.get_p_body("body_obj_plate_11")
+        R_mug = self.env.get_R_body("body_obj_mug_5")
+
+        # 杯身竖直：杯体局部 +z 轴与世界 +z 轴夹角小于 15°
+        upright = R_mug[2, 2] > np.cos(np.deg2rad(15.0))
+
+        # 杯子已静止：读取自由关节的线速度与角速度
+        jntadr = self.env.model.body("body_obj_mug_5").jntadr[0]
+        dofadr = self.env.model.jnt_dofadr[jntadr]
+        vel = self.env.data.qvel[dofadr : dofadr + 6]
+        at_rest = np.linalg.norm(vel[:3]) < 0.05 and np.linalg.norm(vel[3:]) < 0.5
+
         if (
-            np.linalg.norm(p_mug[:2] - p_plate[:2]) < 0.1
+            upright
+            and at_rest
+            and np.linalg.norm(p_mug[:2] - p_plate[:2]) < 0.1
             and np.linalg.norm(p_mug[2] - p_plate[2]) < 0.6
-            and self.env.get_qpos_joint("rh_r1") < 0.1
+            and self.env.get_qpos_joint("rh_r1")[0] < 0.1
         ):
             p = self.env.get_p_body("tcp_link")[2]
             if p > 0.9:

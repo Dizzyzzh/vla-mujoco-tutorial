@@ -1,6 +1,7 @@
 import numpy as np
 from datetime import datetime
 from PIL import Image
+import lerobot
 from mujoco_env.y_env import SimpleEnv
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -10,14 +11,18 @@ REPO_NAME = "omy_pnp"
 NUM_DEMO = 1  # Number of demonstrations to collect
 TASK_NAME = "Put mug cup on the plate"
 XML_PATH = "./asset/example_scene_y.xml"
-CREATE_NEW_DATASET = True  # Set to False if you want to resume recording on an existing dataset
-OLD_DATASET_PATH = "./data/demo_data_20261117_161335"  # 旧数据集路径，如果 CREATE_NEW_DATASET = False，则会在此基础上继续追加 episode
+CREATE_NEW_DATASET = (
+    True  # Set to False if you want to resume recording on an existing dataset
+)
+OLD_DATASET_PATH = (
+    "./data/demo_data_20261117_161335"  # Only used when CREATE_NEW_DATASET = False
+)
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-ROOT = f"./data/demo_data_{timestamp}"
-print(f"Save dataset to: {ROOT}")
+ROOT = f"./data/demo_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+print(f"lerobot version: {lerobot.__version__}")
 
 if CREATE_NEW_DATASET:
+    print(f"Create new dataset: {ROOT}")
     dataset = LeRobotDataset.create(
         repo_id=REPO_NAME,
         root=ROOT,
@@ -32,7 +37,7 @@ if CREATE_NEW_DATASET:
             "observation.wrist_image": {
                 "dtype": "image",
                 "shape": (256, 256, 3),
-                "names": ["height", "width", "channel"],
+                "names": ["height", "width", "channels"],
             },
             "observation.state": {
                 "dtype": "float32",
@@ -47,11 +52,13 @@ if CREATE_NEW_DATASET:
             "obj_init": {
                 "dtype": "float32",
                 "shape": (6,),
-                "names": [
-                    "obj_init"
-                ],  # just the initial position of the object. Not used in training.
+                "names": ["obj_init"],  # initial object pose, not used in training
             },
         },
+        use_videos=False,  # 图像直接内嵌 parquet，不走视频编码
+        image_writer_processes=0,  # Windows 上多进程写图不稳定
+        image_writer_threads=0,  # 同上
+        metadata_buffer_size=1,  # 每集结束立即落盘 episodes 元数据
     )
 else:
     print(f"Resume from previous dataset: {OLD_DATASET_PATH}")
@@ -59,7 +66,7 @@ else:
         repo_id=REPO_NAME,
         root=OLD_DATASET_PATH,
     )
-
+    print(f"Existing episodes: {dataset.meta.total_episodes}")
 
 # Define the environment
 PnPEnv = SimpleEnv(XML_PATH, seed=SEED)
@@ -67,54 +74,65 @@ PnPEnv = SimpleEnv(XML_PATH, seed=SEED)
 action = np.zeros(7)
 episode_id = 0
 record_flag = False  # Start recording when the robot starts moving
-while PnPEnv.env.is_viewer_alive() and episode_id < NUM_DEMO:
-    PnPEnv.step_env()
-    if PnPEnv.env.loop_every(HZ=20):
-        # check if the episode is done
-        done = PnPEnv.check_success()
-        if done:
-            # Save the episode data and reset the environment
-            dataset.save_episode()
-            PnPEnv.reset(seed=SEED)
-            episode_id += 1
-            # Reset recording state for the next episode
-            record_flag = False
-            action = np.zeros(7)
-        else:
-            # Teleoperate the robot and get delta end-effector pose with gripper
-            action, reset = PnPEnv.teleop_robot()
-            if not record_flag and np.any(np.abs(action) > 1e-6):
-                record_flag = True
-                print("Start recording")
-            if reset:
-                # Reset the environment and clear the episode buffer
-                # This can be done by pressing 'z' key
+
+try:
+    while PnPEnv.env.is_viewer_alive() and episode_id < NUM_DEMO:
+        PnPEnv.step_env()
+        if PnPEnv.env.loop_every(HZ=20):
+            done = PnPEnv.check_success()
+            if done:
+                if dataset.has_pending_frames():
+                    dataset.save_episode()
+                    episode_id += 1
+                    print(f"Saved episode {episode_id}/{NUM_DEMO} to {dataset.root}")
+                else:
+                    print(
+                        "Success detected before any frame was recorded, skip saving."
+                    )
                 PnPEnv.reset(seed=SEED)
-                dataset.clear_episode_buffer()
                 record_flag = False
                 action = np.zeros(7)
-            # Step the environment
-            # Get the end-effector pose and images
-            ee_pose = PnPEnv.get_ee_pose()
-            agent_image, wrist_image = PnPEnv.grab_image()
-            agent_image = np.array(Image.fromarray(agent_image).resize((256, 256)))
-            wrist_image = np.array(Image.fromarray(wrist_image).resize((256, 256)))
-            joint_q = PnPEnv.step(action)
-            if record_flag:
-                # Add the frame to the dataset
-                frame = {
-                    "observation.image": agent_image,
-                    "observation.wrist_image": wrist_image,
-                    "observation.state": ee_pose,
-                    "action": joint_q,
-                    "obj_init": PnPEnv.obj_init_pose,
-                    "task": TASK_NAME,
-                }
-                dataset.add_frame(frame)
-        PnPEnv.render(teleop=True)
+            else:
+                action, reset = PnPEnv.teleop_robot()
+                if not record_flag and np.any(np.abs(action) > 1e-6):
+                    record_flag = True
+                    print("Start recording")
+                if reset:
+                    # Press 'z' to reset the environment and clear the current episode buffer
+                    PnPEnv.reset(seed=SEED)
+                    dataset.clear_episode_buffer()
+                    record_flag = False
+                    action = np.zeros(7)
 
+                ee_pose = np.asarray(PnPEnv.get_ee_pose(), dtype=np.float32)
+                agent_image, wrist_image = PnPEnv.grab_image()
+                agent_image = np.asarray(
+                    Image.fromarray(agent_image).resize((256, 256)), dtype=np.uint8
+                )
+                wrist_image = np.asarray(
+                    Image.fromarray(wrist_image).resize((256, 256)), dtype=np.uint8
+                )
+                joint_q = np.asarray(PnPEnv.step(action), dtype=np.float32)
 
-dataset.finalize()
-print("Dataset saved successfully.")
+                if record_flag:
+                    dataset.add_frame(
+                        {
+                            "observation.image": agent_image,
+                            "observation.wrist_image": wrist_image,
+                            "observation.state": ee_pose,
+                            "action": joint_q,
+                            "obj_init": np.asarray(
+                                PnPEnv.obj_init_pose, dtype=np.float32
+                            ),
+                            "task": TASK_NAME,
+                        }
+                    )
+            PnPEnv.render(teleop=True)
+finally:
+    if dataset.has_pending_frames():
+        print("Discard unfinished episode.")
+        dataset.clear_episode_buffer()
+    dataset.finalize()
+    PnPEnv.env.close_viewer()
 
-PnPEnv.env.close_viewer()
+print(f"Dataset saved to: {dataset.root}")
