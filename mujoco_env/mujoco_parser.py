@@ -123,7 +123,6 @@ class MinimalCallbacks:
                     action,
                     dx / height,
                     dy / height,
-                    self.scn,
                     self.cam)
 
         self._last_mouse_x = int(self._scale * xpos)
@@ -182,7 +181,7 @@ class MinimalCallbacks:
     def _scroll_callback(self, window, x_offset, y_offset):
         with self._gui_lock:
             mujoco.mjv_moveCamera(
-                self.model, mujoco.mjtMouse.mjMOUSE_ZOOM, 0, -0.05 * y_offset, self.scn, self.cam)
+                self.model, mujoco.mjtMouse.mjMOUSE_ZOOM, 0, -0.05 * y_offset, self.cam)
 
 class MuJoCoMinimalViewer(MinimalCallbacks):
     def __init__(
