@@ -54,11 +54,7 @@ if CREATE_NEW_DATASET:
                 "shape": (6,),
                 "names": ["obj_init"],  # initial object pose, not used in training
             },
-        },
-        use_videos=False,  # 图像直接内嵌 parquet，不走视频编码
-        image_writer_processes=0,  # Windows 上多进程写图不稳定
-        image_writer_threads=0,  # 同上
-        metadata_buffer_size=1,  # 每集结束立即落盘 episodes 元数据
+        }
     )
 else:
     print(f"Resume from previous dataset: {OLD_DATASET_PATH}")

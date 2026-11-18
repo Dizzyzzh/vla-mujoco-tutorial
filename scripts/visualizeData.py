@@ -1,41 +1,19 @@
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
-from lerobot.datasets.utils import write_json, serialize_dict
+from torch.utils.data import DataLoader
+from lerobot.datasets.utils import serialize_dict
+from lerobot.utils.io_utils import write_json
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from mujoco_env.y_env import SimpleEnv
 
-import torch
+# if youu want to use the example data provided, DATAPATH = './demo_data_example' instead!
+DATAPATH = './data/demo_data_20261118_085434'  # Path to the dataset
 
-class EpisodeSampler(torch.utils.data.Sampler):
-    """
-    Sampler for a single episode
-    """
-    def __init__(self, dataset: LeRobotDataset, episode_index: int):
-        episode = dataset.meta.episodes[episode_index]
-        from_idx = episode["dataset_from_index"]
-        to_idx = episode["dataset_to_index"]
-        self.frame_ids = range(from_idx, to_idx)
-
-    def __iter__(self):
-        return iter(self.frame_ids)
-
-    def __len__(self) -> int:
-        return len(self.frame_ids)
-
-# if youu want to use the example data provided, root = './demo_data_example' instead!
-dataset = LeRobotDataset('omy_pnp', root=f'.\data\demo_data_20261117_163805') 
 # Select an episode index that you want to visualize
 episode_index = 0
 
+dataset = LeRobotDataset('omy_pnp', root=DATAPATH, episodes=[episode_index])
+dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
 
-
-episode_sampler = EpisodeSampler(dataset, episode_index)
-dataloader = torch.utils.data.DataLoader(
-    dataset,
-    num_workers=0,
-    batch_size=1,
-    sampler=episode_sampler,
-)
-
-from mujoco_env.y_env import SimpleEnv
 xml_path = './asset/example_scene_y.xml'
 PnPEnv = SimpleEnv(xml_path, action_type='joint_angle')
 
@@ -68,7 +46,7 @@ while PnPEnv.env.is_viewer_alive():
         PnPEnv.render()
         step += 1
 
-        if step == len(episode_sampler):
+        if step == len(dataset):
             # start from the beginning
             iter_dataloader = iter(dataloader)
             PnPEnv.reset()
