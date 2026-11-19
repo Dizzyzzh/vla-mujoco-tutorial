@@ -536,24 +536,8 @@ class MuJoCoMinimalViewer(MinimalCallbacks):
         """
         w_window, h_window = glfw.get_framebuffer_size(self.window)
         h_overlay, w_overlay = h_window // 4, w_window // 4
-        rgb_overlay = np.zeros((h_overlay, w_overlay, 3))
-        # Fix aspect ratio
-        h_raw, w_raw = rgb.shape[:2]
-        # Calculate scale to preserve aspect ratio
-        scale = min(w_overlay / w_raw, h_overlay / h_raw)
-        w_new = int(w_raw * scale)
-        h_new = int(h_raw * scale)
-        # Resize
-        rgb_resized = cv2.resize(rgb, (w_new, h_new), interpolation=cv2.INTER_NEAREST)
-        # Create a black canvas with the target size
-        rgb_padded = np.zeros((h_overlay, w_overlay, 3), dtype=np.uint8)
-        # Calculate the top-left corner for centering the resized image
-        x_offset = (w_overlay - w_new) // 2
-        y_offset = (h_overlay - h_new) // 2
-        # Place the resized image onto the canvas
-        rgb_padded[y_offset : y_offset + h_new, x_offset : x_offset + w_new] = (
-            rgb_resized
-        )
+        # Stretch to fill the quarter slot (avoids black letterbox bars)
+        rgb_padded = cv2.resize(rgb, (w_overlay, h_overlay), interpolation=cv2.INTER_NEAREST)
         # Store the RGB overlay
         if loc == "top right":
             self.rgb_overlay_top_right = rgb_padded
