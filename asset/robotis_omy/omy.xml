@@ -39,11 +39,13 @@
       <geom type="mesh" rgba="0.2 0.2 0.2 1" mesh="link1"/>
       <body name="link2" pos="0 -0.1215 0">
         <inertial pos="1.14054e-05 0.0161842 0.103606" quat="0.999988 -0.00477885 -0.000609836 0.00067321" mass="3.67954" diaginertia="0.051732 0.0503576 0.00449718"/>
-        <joint name="joint2" pos="0 0 0" axis="0 1 0" class="Y"/>
+        <!-- 限制肩部关节范围 [-90°, +60°]，防止大臂平放压向桌面 -->
+        <joint name="joint2" pos="0 0 0" axis="0 1 0" range="-1.5708 1.05" class="Y"/>
         <geom type="mesh" rgba="0.2 0.2 0.2 1" mesh="link2"/>
         <body name="link3" pos="0 0 0.247">
           <inertial pos="7.81487e-05 0.107185 0.141173" quat="0.999987 0.00500823 0.000469041 -0.00072733" mass="2.38659" diaginertia="0.0226944 0.021922 0.00277422"/>
-          <joint name="joint3" pos="0 0 0" axis="0 1 0" class="Y"/>
+          <!-- 锁定肘部为正值 [+15°, +155°]（严格保持 Elbow-Up 肘朝上构型，杜绝 IK 翻折成肘朝下碰桌/碰隔板） -->
+          <joint name="joint3" pos="0 0 0" axis="0 1 0" range="0.26 2.70" class="Y"/>
           <geom type="mesh" rgba="0.2 0.2 0.2 1" mesh="link3"/>
           <body name="link4" pos="0 0.1215 0.2195">
             <inertial pos="-0.000133183 -0.107467 0.0190907" quat="0.983636 0.179196 0.00338061 -0.0183488" mass="1.40023" diaginertia="0.00175475 0.00162284 0.00115817"/>
@@ -69,24 +71,30 @@
                 <body name="tcp_link" pos="0 -0.22 0">
                   <geom type="capsule" fromto="0 0 -0.5 0 0 0.5" size="0.01" rgba="1.0 0.2 0.2 0.0" contype="0" conaffinity="0"/>
                 </body>
+                <!-- 右侧夹爪近端指节（r1）：condim=4 启用扭转摩擦，高滑动摩擦 1.5 防止抓曲面物体打滑 -->
                 <body name="rh_p12_rn_r1" pos="0.00803822 -0.156994 6.40105e-06" quat="0.500398 0.5 0.5 -0.499602">
                   <inertial pos="0 0.034 0.004" mass="0.068" diaginertia="1e-06 1e-06 1e-06"/>
+                  <!-- 右近端驱动关节：范围 [0, 1.1] 弧度 -->
                   <joint name="rh_r1" pos="0 0 0" axis="1 0 0" range="0 1.1" class="gripper"/>
-                  <geom type="mesh" mesh="r1"/>
+                  <geom type="mesh" mesh="r1" condim="4" friction="1.5 0.05 0.01" solimp="0.99 0.995 0.001" solref="0.01 1"/>
+                  <!-- 右侧夹爪远端指尖（r2）：与 r1 1:1 反向联动以保持指面平行夹持 -->
                   <body name="rh_p12_rn_r2" pos="0 0.0493634 0.0285">
                     <inertial pos="0 0.006 0.011" mass="0.022" diaginertia="1e-06 1e-06 1e-06"/>
                     <joint name="rh_r2" pos="0 0 0" axis="-1 0 0" range="0 1" class="gripper"/>
-                    <geom type="mesh" mesh="r2"/>
+                    <geom type="mesh" mesh="r2" condim="4" friction="1.5 0.05 0.01" solimp="0.99 0.995 0.001" solref="0.01 1"/>
                   </body>
                 </body>
+                <!-- 左侧夹爪近端指节（l1）：与右侧对称配置高摩擦抗扭转接触 -->
                 <body name="rh_p12_rn_l1" pos="-0.00796177 -0.157006 -6.34017e-06" quat="0.500398 0.5 0.5 -0.499602">
                   <inertial pos="0 -0.034 0.004" mass="0.068" diaginertia="1e-06 1e-06 1e-06"/>
+                  <!-- 左近端驱动关节：范围 [0, 1.1] 弧度 -->
                   <joint name="rh_l1" pos="0 0 0" axis="-1 0 0" range="0 1.1" class="gripper"/>
-                  <geom type="mesh" mesh="l1"/>
+                  <geom type="mesh" mesh="l1" condim="4" friction="1.5 0.05 0.01" solimp="0.99 0.995 0.001" solref="0.01 1"/>
+                  <!-- 左侧夹爪远端指尖（l2）：保持与右侧指尖平行夹紧 -->
                   <body name="rh_p12_rn_l2" pos="0 -0.0493634 0.0285">
                     <inertial pos="0 -0.006 0.011" mass="0.022" diaginertia="1e-06 1e-06 1e-06"/>
                     <joint name="rh_l2" pos="0 0 0" axis="1 0 0" range="0 1" class="gripper"/>
-                    <geom type="mesh" mesh="l2"/>
+                    <geom type="mesh" mesh="l2" condim="4" friction="1.5 0.05 0.01" solimp="0.99 0.995 0.001" solref="0.01 1"/>
                   </body>
                 </body>
               </body>
@@ -105,8 +113,8 @@
   <!-- Define actuators -->
   <actuator>
     <position name="actuator_joint1" joint="joint1" class="Y"/>
-    <position name="actuator_joint2" joint="joint2" class="Y"/>
-    <position name="actuator_joint3" joint="joint3" class="Y"/>
+    <position name="actuator_joint2" joint="joint2" ctrlrange="-1.5708 1.05" class="Y"/>
+    <position name="actuator_joint3" joint="joint3" ctrlrange="0.26 2.70" class="Y"/>
     <position name="actuator_joint4" joint="joint4" class="Y"/>
     <position name="actuator_joint5" joint="joint5" class="Y"/>
     <position name="actuator_joint6" joint="joint6" class="Y"/>

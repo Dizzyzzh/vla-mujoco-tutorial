@@ -1,36 +1,36 @@
-<mujoco model="Scanned Objects">
-    <!-- Memory? -->
-    <size memory="500M"/>
-    
-    <!-- Default options -->
-    <!-- <compiler angle="radian" assetdir="./tabletop/mesh" autolimits="true" /> -->
+<mujoco model="Language_Obstacle_Sorting">
+    <!-- 预分配 500MB 仿真求解器内存，保证多网格接触计算不溢出 -->
+    <size memory="500M" />
+
+    <!-- 物理仿真选项：RK4 积分器配合 20 次无滑移迭代，提升抓取接触稳定性 -->
     <option integrator="RK4" noslip_iterations="20" />
+    <!-- 全局默认属性定义 -->
     <default>
+        <!-- 默认关节惯量附加值与阻尼 -->
         <joint armature="0.1" damping="0.1" />
+        <!-- 仅用于视觉渲染、不参与物理碰撞的网格默认类 -->
         <default class="visual_only">
             <geom type="mesh" contype="0" conaffinity="0" group="2" />
         </default>
+        <!-- 仅用于碰撞检测、不在主渲染层显示的隐藏碰撞体默认类 -->
         <default class="no_visual_collision">
-            <!-- visual group of 'collision' should be 3 to not render -->
             <geom type="capsule" solimp=".9 .99 .001" solref=".015 1" group="3" />
         </default>
+        <!-- 同时用于视觉渲染和物理碰撞的网格默认类 -->
         <default class="visual_collision">
             <geom type="mesh" solimp=".9 .99 .001" solref=".015 1" group="2" />
         </default>
     </default>
-    
-    <!-- Sky and floor -->
+
+    <!-- 引入地面与天空盒环境 -->
     <include file="./tabletop/object/floor_isaac_style.xml" />
 
-    <!-- Table -->
+    <!-- 引入木质实验桌及三路固定相机（agentview 主视角 / topview 俯视角 / sideview 侧视角） -->
     <include file="./tabletop/object/object_table.xml" />
-    
-    <!-- UR52 -->
-   
 
+    <!-- 引入 ROBOTIS OpenManipulator-Y 6 轴机械臂与高摩擦平行夹爪模型 -->
     <include file="./robotis_omy/omy.xml" />
-    <include file="./objaverse/mug_5/model_new.xml"/>
-    <include file="./objaverse/plate_11/model_new.xml"/>
-    <!-- <include file="./objaverse/mug_6/model_new.xml"/> -->
 
+    <!-- 引入多物体语言条件跨障分拣场景元素（中间矮隔板、蓝/绿分拣托盘、苹果、橙子、OOD 红牛罐） -->
+    <include file="./sorting_objects.xml" />
 </mujoco>

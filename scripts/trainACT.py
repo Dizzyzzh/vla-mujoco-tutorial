@@ -1,4 +1,6 @@
+import argparse  # 用于解析命令行开关参数
 from pathlib import Path  # 用于跨平台路径拼接与目录创建
+from typing import Optional  # 兼容旧版 Python 的可选类型标注
 
 import matplotlib.pyplot as plt  # 用于绘制预测动作与真值动作的对比曲线
 import torch  # PyTorch 深度学习框架
@@ -12,11 +14,30 @@ from lerobot.policies.factory import make_pre_post_processors  # LeRobot 0.7.0 �
 from lerobot.utils.feature_utils import dataset_to_policy_features  # 将数据集特征格式转换为策略所需特征字典
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-training_steps = 1000  # 总训练迭代步数
+training_steps = 2500  # 总训练迭代步数
 log_freq = 10  # 每隔 10 步打印一次训练日志
-dataset_root = "./demo_data_example"  # 本地数据集根目录
+dataset_root = "./data/sorting_data_20261119_150642"  # 本地数据集根目录
 output_dir = Path("./ckpt/act_y")  # 模型与处理器权重保存目录
 output_dir.mkdir(parents=True, exist_ok=True)  # 递归创建输出目录，若已存在则忽略
+
+# 模型评估开关配置（也可通过命令行参数 --eval / --no-eval 临时覆盖）
+enable_eval = True  # True=训练完成后执行离线开环推理评估；False=关闭评估
+eval_episode_index = 0  # 评估时使用的轨迹编号（从 0 开始）
+eval_show_plot = True  # 是否弹出预测动作与真值动作对比曲线窗口（无图形界面环境可设为 False）
+eval_save_plot = True  # 是否将评估对比图保存至 output_dir 目录
+
+parser = argparse.ArgumentParser(description="训练 ACT 策略并按需执行离线开环模型评估")
+parser.add_argument("--eval", dest="enable_eval", action="store_true", default=enable_eval, help="开启训练后模型评估")
+parser.add_argument("--no-eval", dest="enable_eval", action="store_false", help="关闭训练后模型评估")
+parser.add_argument("--eval-episode", type=int, default=eval_episode_index, help="评估使用的 episode 编号")
+parser.add_argument("--no-plot", dest="eval_show_plot", action="store_false", default=eval_show_plot, help="关闭评估曲线弹窗显示")
+parser.add_argument("--save-eval-plot", dest="eval_save_plot", action="store_true", default=eval_save_plot, help="保存评估对比图到输出目录")
+args = parser.parse_args()
+
+enable_eval = args.enable_eval  # 最终生效的评估总开关
+eval_episode_index = args.eval_episode  # 最终生效的评估轨迹编号
+eval_show_plot = args.eval_show_plot  # 最终生效的弹窗显示开关
+eval_save_plot = args.eval_save_plot  # 最终生效的保存图片开关
 
 # 1. 读取数据集元信息并构建输入/输出特征
 dataset_metadata = LeRobotDatasetMetadata("omy_pnp", root=dataset_root)  # 仅加载元信息（统计量、特征定义、episode 索引等）
@@ -83,55 +104,95 @@ postprocessor.save_pretrained(output_dir)  # 保存输出后处理器配置与�
 
 
 
-# class EpisodeSampler(torch.utils.data.Sampler):
+class EpisodeSampler(torch.utils.data.Sampler):
 
-#     def __init__(self, dataset: LeRobotDataset, episode_index: int):
-#         ep = dataset.meta.episodes[episode_index]  # 获取指定 episode 的元信息字典
-#         from_idx = int(ep["dataset_from_index"])  # 该 episode 在整个数据集中的起始帧索引
-#         to_idx = int(ep["dataset_to_index"])  # 该 episode 在整个数据集中的结束帧索引（不含）
-#         self.frame_ids = range(from_idx, to_idx)  # 生成按时间顺序排列的连续帧索引范围
+    def __init__(self, dataset: LeRobotDataset, episode_index: int):
+        ep = dataset.meta.episodes[episode_index]  # 获取指定 episode 的元信息字典
+        from_idx = int(ep["dataset_from_index"])  # 该 episode 在整个数据集中的起始帧索引
+        to_idx = int(ep["dataset_to_index"])  # 该 episode 在整个数据集中的结束帧索引（不含）
+        self.frame_ids = range(from_idx, to_idx)  # 生成按时间顺序排列的连续帧索引范围
 
-#     def __iter__(self):
-#         return iter(self.frame_ids)  # 返回帧索引迭代器，供 DataLoader 顺序读取
+    def __iter__(self):
+        return iter(self.frame_ids)  # 返回帧索引迭代器，供 DataLoader 顺序读取
 
-#     def __len__(self) -> int:
-#         return len(self.frame_ids)  # 返回该 episode 的总帧数
+    def __len__(self) -> int:
+        return len(self.frame_ids)  # 返回该 episode 的总帧数
 
-# # 6. 离线开环推理验证
-# policy.eval()  # 将模型切换为评估模式（关闭 Dropout 等随机层）
-# policy.reset()  # 重置策略内部维护的动作块缓存队列
-# actions = []  # 用于收集模型预测出的每一步动作
-# gt_actions = []  # 用于收集数据集中的真实动作（Ground Truth）
-# episode_sampler = EpisodeSampler(dataset, episode_index=0)  # 实例化采样器，按顺序读取第 0 条轨迹
-# test_dataloader = torch.utils.data.DataLoader(
-#     dataset,  # 复用同一数据集
-#     num_workers=0,  # 主进程单线程读取
-#     batch_size=1,  # 逐帧推理（模拟在线控制每步输入 1 帧）
-#     shuffle=False,  # 必须关闭打乱，保持时间顺序
-#     pin_memory=device.type != "cpu",  # GPU 推理时开启锁页内存
-#     sampler=episode_sampler,  # 使用自定义顺序采样器
-# )
 
-# with torch.no_grad():  # 推理阶段关闭梯度计算以节省显存并加速
-#     for batch in test_dataloader:  # 按时间步逐帧遍历第 0 条 episode
-#         gt_actions.append(batch["action"][:, 0, :].cpu())  # batch["action"] 形状为 (1, chunk_size, action_dim)，取第 0 步即当前帧真实动作
-#         inp_batch = preprocessor(batch)  # 对当前帧观测进行归一化并迁移至计算设备
-#         pred_action = policy.select_action(inp_batch)  # 策略输出当前步的归一化预测动作（内部每 n_action_steps 步预测一次 chunk）
-#         pred_action = postprocessor(pred_action)  # 将归一化动作反归一化回原始物理尺度
-#         actions.append(pred_action.cpu())  # 移回 CPU 并保存预测结果
+def evaluate_policy(
+    policy: ACTPolicy,
+    dataset: LeRobotDataset,
+    preprocessor,
+    postprocessor,
+    device: torch.device,
+    episode_index: int = 0,
+    show_plot: bool = True,
+    save_plot_path: Optional[Path] = None,
+) -> float:
+    """对指定 episode 执行离线开环推理评估，并按需可视化或保存对比图。"""
+    # 6. 离线开环推理验证
+    policy.eval()  # 将模型切换为评估模式（关闭 Dropout 等随机层）
+    policy.reset()  # 重置策略内部维护的动作块缓存队列
+    actions = []  # 用于收集模型预测出的每一步动作
+    gt_actions = []  # 用于收集数据集中的真实动作（Ground Truth）
+    episode_sampler = EpisodeSampler(dataset, episode_index=episode_index)  # 实例化采样器，按顺序读取指定轨迹
+    test_dataloader = torch.utils.data.DataLoader(
+        dataset,  # 复用同一数据集
+        num_workers=0,  # 主进程单线程读取
+        batch_size=1,  # 逐帧推理（模拟在线控制每步输入 1 帧）
+        shuffle=False,  # 必须关闭打乱，保持时间顺序
+        pin_memory=device.type != "cpu",  # GPU 推理时开启锁页内存
+        sampler=episode_sampler,  # 使用自定义顺序采样器
+    )
 
-# actions = torch.cat(actions, dim=0)  # 将所有时间步的预测动作拼接为 (T, action_dim) 张量
-# gt_actions = torch.cat(gt_actions, dim=0)  # 将所有时间步的真实动作拼接为 (T, action_dim) 张量
-# print(f"Mean action error: {torch.mean(torch.abs(actions - gt_actions)).item():.3f}")  # 计算并打印整条轨迹的平均绝对误差（MAE）
+    with torch.no_grad():  # 推理阶段关闭梯度计算以节省显存并加速
+        for batch in test_dataloader:  # 按时间步逐帧遍历指定 episode
+            gt_actions.append(batch["action"][:, 0, :].cpu())  # batch["action"] 形状为 (1, chunk_size, action_dim)，取第 0 步即当前帧真实动作
+            inp_batch = preprocessor(batch)  # 对当前帧观测进行归一化并迁移至计算设备
+            pred_action = policy.select_action(inp_batch)  # 策略输出当前步的归一化预测动作（内部每 n_action_steps 步预测一次 chunk）
+            pred_action = postprocessor(pred_action)  # 将归一化动作反归一化回原始物理尺度
+            actions.append(pred_action.cpu())  # 移回 CPU 并保存预测结果
 
-# # 7. 可视化预测动作与真值动作对比
-# action_dim = actions.shape[-1]  # 获取动作维度（例如机械臂各关节自由度数量）
-# fig, axs = plt.subplots(action_dim, 1, figsize=(10, 10))  # 创建 action_dim 行、1 列的子图布局
-# for i in range(action_dim):  # 遍历动作的每一个维度
-#     axs[i].plot(actions[:, i].numpy(), label="pred")  # 绘制第 i 维的预测动作曲线
-#     axs[i].plot(gt_actions[:, i].numpy(), label="gt")  # 绘制第 i 维的真实动作曲线
-#     axs[i].legend()  # 显示图例
-# plt.tight_layout()  # 自动调整子图间距，避免标签重叠
-# plt.show()  # 弹出窗口显示对比图
+    actions = torch.cat(actions, dim=0)  # 将所有时间步的预测动作拼接为 (T, action_dim) 张量
+    gt_actions = torch.cat(gt_actions, dim=0)  # 将所有时间步的真实动作拼接为 (T, action_dim) 张量
+    mean_action_error = torch.mean(torch.abs(actions - gt_actions)).item()  # 计算整条轨迹的平均绝对误差（MAE）
+    print(f"[Eval] Episode {episode_index} Mean action error: {mean_action_error:.3f}")  # 打印评估误差
+
+    # 7. 可视化预测动作与真值动作对比
+    if show_plot or save_plot_path is not None:
+        action_dim = actions.shape[-1]  # 获取动作维度（例如机械臂各关节自由度数量）
+        fig, axs = plt.subplots(action_dim, 1, figsize=(10, 10))  # 创建 action_dim 行、1 列的子图布局
+        if action_dim == 1:  # 兼容单维动作，确保 axs 可按索引访问
+            axs = [axs]
+        for i in range(action_dim):  # 遍历动作的每一个维度
+            axs[i].plot(actions[:, i].numpy(), label="pred")  # 绘制第 i 维的预测动作曲线
+            axs[i].plot(gt_actions[:, i].numpy(), label="gt")  # 绘制第 i 维的真实动作曲线
+            axs[i].legend()  # 显示图例
+        plt.tight_layout()  # 自动调整子图间距，避免标签重叠
+        if save_plot_path is not None:  # 如开启保存开关，先保存对比图到磁盘
+            plt.savefig(save_plot_path, dpi=150)
+            print(f"[Eval] Saved evaluation plot to: {save_plot_path}")
+        if show_plot:  # 如开启弹窗开关，弹出窗口显示对比图
+            plt.show()
+        else:
+            plt.close(fig)  # 不弹窗时及时关闭画布释放内存
+
+    return mean_action_error
+
+
+if enable_eval:  # 按开关决定是否在训练结束后运行模型评估
+    plot_path = output_dir / f"eval_episode_{eval_episode_index}.png" if eval_save_plot else None
+    evaluate_policy(
+        policy=policy,
+        dataset=dataset,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        device=device,
+        episode_index=eval_episode_index,
+        show_plot=eval_show_plot,
+        save_plot_path=plot_path,
+    )
+else:
+    print("[Eval] 模型评估已关闭（可将 enable_eval 设为 True 或使用 --eval 参数开启）。")
 
 

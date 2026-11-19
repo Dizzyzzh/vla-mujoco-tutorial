@@ -1,0 +1,115 @@
+<mujocoinclude>
+    <!-- ==================== 1. 贴图、材质与三维网格资源声明 ==================== -->
+    <asset>
+        <!-- 苹果贴图：复用 tabletop/mesh 下的 YCB 苹果纹理 -->
+        <texture type="2d" name="sorting_apple_tex" file="tabletop/mesh/ycb-apple.png" />
+        <!-- 苹果材质：绑定苹果纹理并设置适度高光与光泽度 -->
+        <material name="sorting_apple_mat" texture="sorting_apple_tex" specular="0.35" shininess="0.3" />
+        <!-- 苹果网格：等比缩放 0.78 倍，使外径降至约 5.8cm，适配 10.7cm 夹爪开口 -->
+        <mesh name="sorting_apple_mesh" file="tabletop/mesh/ycb-apple.obj" scale="0.78 0.78 0.78" />
+
+        <!-- 橙子贴图：复用 tabletop/mesh 下的 YCB 橙子纹理 -->
+        <texture type="2d" name="sorting_orange_tex" file="tabletop/mesh/ycb-orange.png" />
+        <!-- 橙子材质：绑定橙子纹理并设置柔和果皮反光 -->
+        <material name="sorting_orange_mat" texture="sorting_orange_tex" specular="0.3" shininess="0.25" />
+        <!-- 橙子网格：等比缩放 0.78 倍，外径约 5.7cm -->
+        <mesh name="sorting_orange_mesh" file="tabletop/mesh/ycb-orange.obj" scale="0.78 0.78 0.78" />
+
+        <!-- 红牛罐贴图：用作 OOD（分布外）视觉与空间干扰物 -->
+        <texture type="2d" name="sorting_redbull_tex" file="tabletop/mesh/redbullcan.png" />
+        <!-- 红牛罐材质：略高金属反光以还原易拉罐质感 -->
+        <material name="sorting_redbull_mat" texture="sorting_redbull_tex" specular="0.45" shininess="0.4" />
+        <!-- 红牛罐网格：缩放 0.0085，直径约 4.7cm、高约 11.5cm -->
+        <mesh name="sorting_redbull_mesh" file="tabletop/mesh/redbullcan.obj" scale="0.0085 0.0085 0.0085" />
+
+        <!-- 蓝色托盘底板与围边材质 -->
+        <material name="tray_blue_base_mat" rgba="0.16 0.42 0.88 1.0" specular="0.2" shininess="0.2" />
+        <material name="tray_blue_wall_mat" rgba="0.10 0.30 0.72 1.0" specular="0.25" shininess="0.25" />
+        <!-- 绿色托盘底板与围边材质 -->
+        <material name="tray_green_base_mat" rgba="0.18 0.72 0.34 1.0" specular="0.2" shininess="0.2" />
+        <material name="tray_green_wall_mat" rgba="0.11 0.54 0.24 1.0" specular="0.25" shininess="0.25" />
+        <!-- 中间跨障隔板半透明主体与顶部橙色警示边条材质 -->
+        <material name="barrier_glass_mat" rgba="0.82 0.88 0.96 0.42" specular="0.5" shininess="0.5" />
+        <material name="barrier_trim_mat" rgba="0.95 0.42 0.14 0.95" specular="0.3" shininess="0.3" />
+    </asset>
+
+    <!-- ==================== 2. 场景静态结构与可抓取动态刚体 ==================== -->
+    <worldbody>
+        <!-- 中间跨障矮隔板：位于 Y=0，X∈[0.175, 0.435]（随桌边同步拉近至机械臂舒适抓取区间） -->
+        <body name="sorting_barrier" pos="0.305 0.0 0.800">
+            <!-- 隔板碰撞与半透明视觉体：长 26cm、厚 1.2cm、高 5.5cm（z∈[0.800, 0.855]） -->
+            <geom name="barrier_wall" type="box" pos="0 0 0.0275" size="0.130 0.006 0.0275"
+                material="barrier_glass_mat" friction="0.6 0.005 0.0001" />
+            <!-- 顶部高亮警示条（仅视觉无碰撞），标示隔板最高边沿 z=0.8555 -->
+            <geom name="barrier_top_trim" type="box" pos="0 0 0.0555" size="0.130 0.007 0.0025"
+                material="barrier_trim_mat" contype="0" conaffinity="0" />
+        </body>
+
+        <!-- 蓝色分拣托盘：位于右侧靠近桌边一侧，中心世界坐标 (0.240, +0.200, 0.800) -->
+        <body name="tray_blue" pos="0.240 0.200 0.800">
+            <!-- 托盘底板：外宽 13.6cm×13.6cm，厚 4mm（盘底顶面 z=0.804），高摩擦防滚动 -->
+            <geom name="tray_blue_floor" type="box" pos="0 0 0.002" size="0.068 0.068 0.002"
+                material="tray_blue_base_mat" friction="1.2 0.05 0.01" condim="4" />
+            <!-- 四周低围边：厚 8mm、高 1.8cm，内部有效空间 12cm×12cm -->
+            <geom name="tray_blue_wall_px" type="box" pos="0.064 0 0.009" size="0.004 0.068 0.009"
+                material="tray_blue_wall_mat" />
+            <geom name="tray_blue_wall_nx" type="box" pos="-0.064 0 0.009" size="0.004 0.068 0.009"
+                material="tray_blue_wall_mat" />
+            <geom name="tray_blue_wall_py" type="box" pos="0 0.064 0.009" size="0.060 0.004 0.009"
+                material="tray_blue_wall_mat" />
+            <geom name="tray_blue_wall_ny" type="box" pos="0 -0.064 0.009" size="0.060 0.004 0.009"
+                material="tray_blue_wall_mat" />
+        </body>
+
+        <!-- 绿色分拣托盘：位于右侧靠近主相机一侧，中心世界坐标 (0.385, +0.200, 0.800) -->
+        <body name="tray_green" pos="0.385 0.200 0.800">
+            <!-- 托盘底板：高摩擦防滚动，内部有效空间 12cm×12cm -->
+            <geom name="tray_green_floor" type="box" pos="0 0 0.002" size="0.068 0.068 0.002"
+                material="tray_green_base_mat" friction="1.2 0.05 0.01" condim="4" />
+            <!-- 四周低围边 -->
+            <geom name="tray_green_wall_px" type="box" pos="0.064 0 0.009" size="0.004 0.068 0.009"
+                material="tray_green_wall_mat" />
+            <geom name="tray_green_wall_nx" type="box" pos="-0.064 0 0.009" size="0.004 0.068 0.009"
+                material="tray_green_wall_mat" />
+            <geom name="tray_green_wall_py" type="box" pos="0 0.064 0.009" size="0.060 0.004 0.009"
+                material="tray_green_wall_mat" />
+            <geom name="tray_green_wall_ny" type="box" pos="0 -0.064 0.009" size="0.060 0.004 0.009"
+                material="tray_green_wall_mat" />
+        </body>
+
+        <!-- 目标物体 1：苹果（自由刚体，每次 reset 在左侧桌边抓取区随机位置） -->
+        <body name="body_obj_apple" pos="0.30 -0.16 0.805">
+            <freejoint />
+            <inertial pos="0 0 0.028" mass="0.12" diaginertia="0.00012 0.00012 0.00012" />
+            <geom name="geom_obj_apple" type="mesh" mesh="sorting_apple_mesh" material="sorting_apple_mat"
+                condim="4" friction="1.2 0.05 0.01" solimp="0.99 0.995 0.001" solref="0.01 1" />
+            <!-- 底部全透明防滚支撑片，确保水果稳定直立 -->
+            <geom name="geom_obj_apple_base" type="box" pos="0 0 0.0006" size="0.018 0.018 0.0006"
+                rgba="0 0 0 0" condim="4" friction="1.2 0.05 0.01" />
+        </body>
+
+        <!-- 目标物体 2：橙子（自由刚体，每次 reset 在左侧桌边抓取区随机位置） -->
+        <body name="body_obj_orange" pos="0.39 -0.18 0.805">
+            <freejoint />
+            <inertial pos="0 0 0.028" mass="0.12" diaginertia="0.00012 0.00012 0.00012" />
+            <geom name="geom_obj_orange" type="mesh" pos="0.0008 0.0133 0" mesh="sorting_orange_mesh"
+                material="sorting_orange_mat" condim="4" friction="1.2 0.05 0.01"
+                solimp="0.99 0.995 0.001" solref="0.01 1" />
+            <!-- 底部全透明防滚支撑片 -->
+            <geom name="geom_obj_orange_base" type="box" pos="0 0 0.0006" size="0.018 0.018 0.0006"
+                rgba="0 0 0 0" condim="4" friction="1.2 0.05 0.01" />
+        </body>
+
+        <!-- OOD 干扰物：红牛罐（平时停放于所有相机视野外，开启 ood_distractor=True 时置入桌面） -->
+        <body name="body_obj_redbull" pos="-1.50 0.0 0.05">
+            <freejoint />
+            <inertial pos="0 0 0.055" mass="0.15" diaginertia="0.00020 0.00020 0.00008" />
+            <geom name="geom_obj_redbull" type="mesh" euler="1.5708 -1.5708 0" mesh="sorting_redbull_mesh"
+                material="sorting_redbull_mat" condim="4" friction="1.2 0.05 0.01"
+                solimp="0.99 0.995 0.001" solref="0.01 1" />
+            <!-- 底部全透明防倒支撑片 -->
+            <geom name="geom_obj_redbull_base" type="box" pos="0 0 0.0006" size="0.020 0.020 0.0006"
+                rgba="0 0 0 0" condim="4" friction="1.2 0.05 0.01" />
+        </body>
+    </worldbody>
+</mujocoinclude>
