@@ -29,11 +29,6 @@ INSTRUCTION_OVERRIDE = None  # 可选：自定义同义改写指令，不为 Non
 OOD_DISTRACTOR = False  # True 时在抓取区加入红牛罐干扰物（测试抗干扰泛化）
 OOD_POSITION = False  # True 时扩大物体位置采样范围（测试空间外推泛化）
 
-# 状态输入类型：须与训练数据集 observation.state 保持一致
-#   "joint_angle": 6 维关节角（对应当前 scripts/collectData.py 新场景采集的数据）
-#   "ee_pose"    : 6 维末端位姿（仅当权重是用旧版 demo_data_example 训练时使用）
-STATE_TYPE = "joint_angle"
-
 # 时序集成（Temporal Ensemble）：每步重推理并加权平滑历史动作块，轨迹更顺滑
 # 若希望直接按训练时的 n_action_steps（如每 10 步推理一次）运行，将其设为 False
 USE_TEMPORAL_ENSEMBLE = True
@@ -64,12 +59,7 @@ def load_act_policy(ckpt_path: str, device: str):
 
 def build_observation(env: SimpleEnv, policy: ACTPolicy, img_transform, device: str):
     """采集当前仿真状态与相机画面，组装为 LeRobot 预处理器所需的观测字典。"""
-    if STATE_TYPE == "joint_angle":  # 读取 6 维机械臂当前关节角（与新场景采集格式一致）
-        state = env.get_joint_state()[:6]
-    elif STATE_TYPE == "ee_pose":  # 读取 6 维末端执行器位姿（兼容旧版数据集格式）
-        state = env.get_ee_pose()
-    else:
-        raise ValueError(f"Unsupported STATE_TYPE: {STATE_TYPE}")
+    state = env.get_joint_state()[:6]  # 读取 6 维机械臂当前关节角（与采集数据的 observation.state 一致）
 
     agent_img, wrist_img = env.grab_image()  # 从 MuJoCo 固定相机抓取主视角与腕部视角 RGB 图像
     agent_tensor = img_transform(Image.fromarray(agent_img).resize((256, 256)))  # 缩放至 256×256 并转为 CHW [0,1] 张量
@@ -99,7 +89,6 @@ def main():
     env = SimpleEnv(
         XML_PATH,
         action_type="joint_angle",
-        state_type="joint_angle",
         seed=SEED,
         task_idx=TASK_IDX,
         ood_distractor=OOD_DISTRACTOR,
@@ -150,33 +139,20 @@ def main():
                         success = True  # 标记本回合成功
                         break  # 提前结束本回合进入下一回合
 
-            stage = env.get_stage_info()  # 读取本回合的抓起/越障/入框分阶段统计
-            stage["success"] = success  # 写入最终成功标志
-            stage["steps"] = step  # 记录耗时步数
-            results.append(stage)  # 存入汇总列表
-            print(
-                f"[Episode {ep + 1}/{NUM_EPISODES}] "
-                f"success={success} | steps={step} "
-                f"| grasp={stage['grasped']}, cross={stage['crossed_barrier']}, place={stage['placed']}"
-            )
+            results.append({"success": success, "steps": step})  # 记录本回合结果
+            print(f"[Episode {ep + 1}/{NUM_EPISODES}] success={success} | steps={step}")
     finally:
         env.env.close_viewer()  # 无论正常完成还是中断退出，均释放 MuJoCo 渲染窗口
 
     # 打印多回合汇总指标（可直接用于实验对比表）
     if results:
         n = len(results)  # 实际完成的评测回合数
-        grasp_rate = sum(r["grasped"] for r in results) / n * 100.0  # 抓取成功率
-        cross_rate = sum(r["crossed_barrier"] for r in results) / n * 100.0  # 越障成功率
-        place_rate = sum(r["placed"] for r in results) / n * 100.0  # 放置入框率
         succ_rate = sum(r["success"] for r in results) / n * 100.0  # 端到端任务总成功率
         avg_ms = float(np.mean(infer_times_ms)) if infer_times_ms else 0.0  # 平均单步推理耗时（ms）
         fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0  # 等效推理帧率（Hz）
         print("\n========== Evaluation Summary ==========")
         print(f"Checkpoint : {CKPT_PATH}")
         print(f"Episodes   : {n} (OOD distractor={OOD_DISTRACTOR}, OOD pos={OOD_POSITION})")
-        print(f"Grasp      : {grasp_rate:.1f}%")
-        print(f"Cross      : {cross_rate:.1f}%")
-        print(f"Place      : {place_rate:.1f}%")
         print(f"Success    : {succ_rate:.1f}% ({sum(r['success'] for r in results)}/{n})")
         print(f"Inference  : {avg_ms:.2f} ms/step ({fps:.1f} FPS)")
         print("========================================")

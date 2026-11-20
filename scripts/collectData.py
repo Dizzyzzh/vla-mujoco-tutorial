@@ -93,7 +93,6 @@ cur_task_idx = get_next_task_idx(start_ep_offset, TASK_MODE)  # 计算第 1 条�
 PnPEnv = SimpleEnv(  # 实例化跨障分拣 MuJoCo 仿真环境并弹出可视化窗口
     XML_PATH,  # 场景 XML 路径
     action_type="eef_pose",  # 采集时采用末端位姿增量模式，方便键盘与手柄直觉操作
-    state_type="joint_angle",  # 状态空间设为关节角
     seed=SEED,  # 随机种子
     task_idx=cur_task_idx,  # 初始任务索引
     ood_distractor=OOD_DISTRACTOR,  # 是否开启红牛罐干扰物
@@ -111,14 +110,9 @@ try:  # 使用 try...finally 确保中途关闭窗口或 Ctrl+C 时也能安全�
             done = PnPEnv.check_success()  # 检查当前帧是否已满足全部任务成功条件
             if done:  # 若本条演示已成功完成
                 if dataset.has_pending_frames():  # 确认缓冲区中确实已有录制帧（防止空轨迹误存）
-                    stage = PnPEnv.get_stage_info()  # 读取本条轨迹的抓起/越障/入框分阶段完成信息
                     dataset.save_episode()  # 将当前 episode 写入磁盘并更新数据集统计量
                     episode_id += 1  # 已完成轨迹数加 1
-                    print(  # 打印保存成功日志、对应指令与三阶段达成状态
-                        f"Saved episode {episode_id}/{NUM_COLLECT} "
-                        f"| Task: {PnPEnv.instruction} "
-                        f"| Stages: grasp={stage['grasped']}, cross={stage['crossed_barrier']}, place={stage['placed']}"
-                    )
+                    print(f"Saved episode {episode_id}/{NUM_COLLECT} | Task: {PnPEnv.instruction}")  # 打印保存成功日志与对应指令
                 else:  # 尚未开始移动就意外满足成功条件时跳过保存
                     print("Success detected before any frame was recorded, skip saving.")
 

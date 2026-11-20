@@ -14,9 +14,9 @@ from lerobot.policies.factory import make_pre_post_processors  # LeRobot 0.7.0 �
 from lerobot.utils.feature_utils import dataset_to_policy_features  # 将数据集特征格式转换为策略所需特征字典
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-training_steps = 2500  # 总训练迭代步数
+training_steps = 5000  # 总训练迭代步数
 log_freq = 10  # 每隔 10 步打印一次训练日志
-dataset_root = "./data/sorting_data_20261119_150642"  # 本地数据集根目录
+dataset_root = "./data/ACT_dataset"  # 本地数据集根目录
 output_dir = Path("./ckpt/act_y")  # 模型与处理器权重保存目录
 output_dir.mkdir(parents=True, exist_ok=True)  # 递归创建输出目录，若已存在则忽略
 

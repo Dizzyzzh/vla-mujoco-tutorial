@@ -58,8 +58,7 @@ class SimpleEnv:
     def __init__(  # 环境初始化方法
         self,
         xml_path,  # MuJoCo 场景主 XML 文件路径
-        action_type="eef_pose",  # 动作输入模式：'eef_pose'(遥操作末端增量) / 'joint_angle'(策略推理绝对关节角) / 'delta_joint_angle'
-        state_type="joint_angle",  # step() 返回的状态类型：'joint_angle' / 'ee_pose' / 'delta_q'
+        action_type="eef_pose",  # 动作输入模式：'eef_pose'(遥操作末端增量) / 'joint_angle'(策略推理绝对关节角)
         seed=None,  # 随机种子：传入整数可固定物体初位，None 则每次重置随机化
         task_idx=None,  # 默认任务索引（0~3）；为 None 时每次 reset 随机抽取任务
         ood_distractor=False,  # 是否默认开启 OOD 干扰物（红牛罐）
@@ -69,7 +68,6 @@ class SimpleEnv:
         # 加载 MuJoCo XML 模型并创建底层仿真解析器实例
         self.env = MuJoCoParserClass(name="LanguageObstacleSorting", rel_xml_path=xml_path)
         self.action_type = action_type  # 保存动作控制模式
-        self.state_type = state_type  # 保存返回状态类型
         self.default_task_idx = task_idx  # 保存默认任务索引
         self.ood_distractor = ood_distractor  # 保存默认 OOD 干扰物开关
         self.ood_position = ood_position  # 保存默认 OOD 位置扩展开关
@@ -88,9 +86,6 @@ class SimpleEnv:
         self.obj_other = self.TASKS[0]["other_obj"]  # 初始化当前非目标物体刚体名
         self.tray_target = self.TASKS[0]["target_tray"]  # 初始化当前目标托盘刚体名
 
-        self._stage_grasped = False  # 阶段里程碑 1：目标物体是否已被成功抓起离桌
-        self._stage_crossed = False  # 阶段里程碑 2：抓起后是否已携带目标越过中间隔板
-        self._stage_placed = False  # 阶段里程碑 3：目标物体是否已落入目标托盘
         self._gp_status_text = "Not Connected"  # 窗口叠加显示用的手柄连接状态文案
 
         if not self.headless:  # 若处于可视化交互模式
@@ -198,7 +193,7 @@ class SimpleEnv:
             joint_names_for_ik=self.joint_names,  # 参与求解的 6 个臂关节名
             body_name_trgt="tcp_link",  # 以末端夹爪中心 tcp_link 为目标连杆
             q_init=q_init,  # 初始迭代猜测角度
-            p_trgt=np.array([0.29, -0.02, 1.02]),  # 初始位置在桌边隔板上方安全高度，便于左右观察与移动
+            p_trgt=np.array([0.29, -0.02, 0.95]),  # 初始位置在桌边隔板上方安全高度，便于左右观察与移动
             R_trgt=rpy2r(np.deg2rad([90, 0.0, 90])),  # 末端垂直朝向桌面抓取的基准姿态旋转矩阵
         )
         # 通过前向运动学直接将机械臂摆放到初始关节角（不推进仿真计时器）
@@ -245,7 +240,6 @@ class SimpleEnv:
         self.env.forward(increase_tick=False)  # 刷新前向运动学使所有刚体位置立即生效
 
         # 3. 初始化机械臂控制目标缓存（6 轴臂关节 + 4 轴夹爪关节初始全张开为 0）
-        self.last_q = copy.deepcopy(q_zero)  # 记录上一时刻 6 轴关节角（供 delta_joint_angle 模式使用）
         self.compute_q = copy.deepcopy(q_zero)  # 记录最近一次计算出的 6 轴目标关节角
         self.q = np.concatenate([q_zero, np.array([0.0] * 4)])  # 拼接 10 维执行器目标向量
         self.p0, self.R0 = self.env.get_pR_body(body_name="tcp_link")  # 缓存末端初始位置 p0 与姿态 R0，作为增量遥操作基准
@@ -264,9 +258,6 @@ class SimpleEnv:
         self.set_instruction(given=instruction, task_idx=task_idx)  # 绑定本轮指令与目标物体/托盘
         self.gripper_state = False  # 夹爪初始逻辑状态设为张开（False=0.0, True=1.0）
         self.past_chars = []  # 预留历史按键缓存列表
-        self._stage_grasped = False  # 重置“已抓起”里程碑标志
-        self._stage_crossed = False  # 重置“已越障”里程碑标志
-        self._stage_placed = False  # 重置“已入框”里程碑标志
         print(f"DONE INITIALIZATION | Task: {self.instruction}")  # 在终端打印本轮任务指令方便操作者查看
 
     def step(self, action):
@@ -276,7 +267,6 @@ class SimpleEnv:
             action: 长度为 7 的 NumPy 数组
                 - eef_pose 模式: [dx, dy, dz, droll, dpitch, dyaw, gripper]
                 - joint_angle 模式: [j1, j2, j3, j4, j5, j6, gripper]
-                - delta_joint_angle 模式: [dj1, dj2, dj3, dj4, dj5, dj6, gripper]
         """
         if self.action_type == "eef_pose":  # 末端位姿增量模式（用于人工键盘/手柄遥操作）
             q = self.env.get_qpos_joints(joint_names=self.joint_names)  # 读取当前实际 6 轴关节角作为 IK 迭代初值
@@ -300,8 +290,6 @@ class SimpleEnv:
                 render=False,  # 求解过程不触发渲染
                 verbose_warning=False,  # 关闭迭代未完全收敛时的刷屏警告
             )
-        elif self.action_type == "delta_joint_angle":  # 关节角增量模式
-            q = action[:-1] + self.last_q  # 在上一帧目标关节角基础上叠加 6 维增量
         elif self.action_type == "joint_angle":  # 绝对关节角模式（用于 ACT / SmolVLA / Pi0 策略推理及数据回放）
             q = action[:-1]  # 直接取动作前 6 维作为目标关节角
         else:  # 传入了不支持的动作模式名
@@ -322,16 +310,7 @@ class SimpleEnv:
         self.compute_q = q  # 保存最新解算出的 6 轴目标关节角
         self.q = np.concatenate([q, gripper_cmd])  # 拼接 6 轴臂关节 + 4 轴夹爪指令为 10 维底层控制量
 
-        self._update_stage_info()  # 同步更新抓起/越障/入框分阶段里程碑状态
-
-        if self.state_type == "joint_angle":  # 若配置返回关节状态
-            return self.get_joint_state()  # 返回 7 维 [j1..j6, gripper]
-        elif self.state_type == "ee_pose":  # 若配置返回末端位姿
-            return self.get_ee_pose()  # 返回 6 维 [x, y, z, roll, pitch, yaw]
-        elif self.state_type == "delta_q":  # 若配置返回关节增量
-            return self.get_delta_q()  # 返回 7 维 [dj1..dj6, gripper]
-        else:  # 未知的状态类型
-            raise ValueError("state_type not recognized")  # 抛出值异常
+        return self.get_joint_state()  # 返回 7 维 [j1..j6, gripper]
 
     def step_env(self):
         """将当前控制目标 self.q 写入 MuJoCo 执行器并推进一个物理仿真步长（dt=0.002s）"""
@@ -350,8 +329,8 @@ class SimpleEnv:
         p_current, R_current = self.env.get_pR_body(body_name="tcp_link")  # 获取当前末端执行器的世界位置与旋转矩阵
         R_current = R_current @ np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])  # 调整胶囊体局部轴向以与夹爪朝向一致
         self.env.plot_sphere(p=p_current, r=0.015, rgba=[0.95, 0.05, 0.05, 0.45])  # 在末端中心绘制半透明红色标记球
-        self.env.plot_capsule(  # 绘制加长半透明绿色指示柱（半长 0.35m，从高处即可直达桌面精确瞄准落点）
-            p=p_current, R=R_current, r=0.006, h=0.35, rgba=[0.05, 0.95, 0.05, 0.55]
+        self.env.plot_capsule(  # 绘制指示柱（半长 0.35m，从高处即可直达桌面精确瞄准落点）
+            p=p_current, R=R_current, r=0.006, h=0.35, rgba = [1.0, 1.0, 1.0, 0.5]   # 白色指示线
         )
         if idx is not None:  # 若传入了当前 episode 编号
             self.env.plot_T(  # 在场景上方悬浮绘制 Episode 编号文字
@@ -553,14 +532,6 @@ class SimpleEnv:
             "reset": pressed["Y"] or pressed["START"],  # 本帧是否触发轨迹重置
         }
 
-    def get_delta_q(self):
-        """计算相对上一帧的目标关节角增量，返回 7 维向量 [dj1..dj6, gripper]"""
-        delta = self.compute_q - self.last_q  # 计算 6 轴目标关节角相对上一帧的变化量
-        self.last_q = copy.deepcopy(self.compute_q)  # 刷新上一帧关节角缓存
-        gripper = self.env.get_qpos_joint("rh_r1")  # 读取当前夹爪开合角
-        gripper_cmd = 1.0 if gripper[0] > 0.5 else 0.0  # 二值化夹爪状态
-        return np.concatenate([delta, [gripper_cmd]], dtype=np.float32)  # 拼接返回 7 维增量状态
-
     def _is_in_tray(self, obj_pos, tray_name):
         """判断给定物体坐标是否位于指定分拣托盘的内部有效空间且贴近托盘底面"""
         p_tray = self.env.get_p_body(tray_name)  # 获取目标托盘中心的世界坐标
@@ -578,40 +549,6 @@ class SimpleEnv:
         dofadr = self.env.model.jnt_dofadr[jntadr]  # 获取其在全局速度向量 qvel 中的起始偏移
         vel = self.env.data.qvel[dofadr : dofadr + 6]  # 切片取出 6 维广义速度（前 3 线速度 + 后 3 角速度）
         return float(np.linalg.norm(vel[:3])), float(np.linalg.norm(vel[3:]))  # 返回线速度与角速度大小
-
-    def _update_stage_info(self):
-        """实时追踪“抓取 → 越障 → 入框”三个过程里程碑，供策略评测做分阶段漏斗归因分析"""
-        p_target = self.env.get_p_body(self.obj_target)  # 获取当前任务目标物体的世界坐标
-        p_tcp = self.env.get_p_body("tcp_link")  # 获取当前夹爪末端中心坐标
-        gripper_q = float(self.env.get_qpos_joint("rh_r1")[0])  # 读取夹爪当前闭合程度
-
-        # 阶段 1（grasped）：目标物体离桌抬高 4.5cm 以上、夹爪处于闭合态且物体紧贴夹爪中心
-        if (
-            p_target[2] > 0.845
-            and gripper_q > 0.20
-            and np.linalg.norm(p_target - p_tcp) < 0.11
-        ):
-            self._stage_grasped = True  # 点亮“成功抓取”标志
-
-        # 阶段 2（crossed_barrier）：已成功抓起，且目标物体已带过中间隔板（Y > 0.02）并保持足够高度
-        if self._stage_grasped and p_target[1] > 0.02 and p_target[2] > 0.855:
-            self._stage_crossed = True  # 点亮“成功越障”标志
-
-        # 阶段 3（placed）：目标物体已落入目标托盘区域内
-        if self._is_in_tray(p_target, self.tray_target):
-            self._stage_placed = True  # 点亮“成功入框”标志
-
-    def get_stage_info(self):
-        """返回包含任务指令与各阶段完成情况的结构化评测字典"""
-        return {
-            "instruction": self.instruction,  # 当前测试的自然语言指令
-            "target_obj": self.obj_target,  # 应抓取的目标物体名
-            "target_tray": self.tray_target,  # 应放入的目标托盘名
-            "grasped": self._stage_grasped,  # 阶段 1：是否成功抓起
-            "crossed_barrier": self._stage_crossed,  # 阶段 2：是否成功越障
-            "placed": self._stage_placed,  # 阶段 3：是否放入目标托盘
-            "success": self.check_success(),  # 最终任务是否完全成功
-        }
 
     def check_success(self):
         """
@@ -669,8 +606,3 @@ class SimpleEnv:
         self.env.forward(increase_tick=False)  # 立即更新前向运动学几何位置
         self.step_env()  # 推进一帧仿真刷新接触状态
 
-    def get_ee_pose(self):
-        """读取并返回末端执行器当前的 6 维位姿向量 [x, y, z, roll, pitch, yaw]"""
-        p, R = self.env.get_pR_body(body_name="tcp_link")  # 读取末端位置向量 p 与 3x3 旋转矩阵 R
-        rpy = r2rpy(R)  # 将旋转矩阵转换为欧拉角 [roll, pitch, yaw]
-        return np.concatenate([p, rpy], dtype=np.float32)  # 拼接并返回 6 维 float32 位姿向量
