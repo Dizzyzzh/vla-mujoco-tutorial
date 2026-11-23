@@ -11,11 +11,11 @@ from lerobot.policies.factory import make_pre_post_processors  # LeRobot 0.7.0 �
 from mujoco_env.y_env import SimpleEnv  # 多物体语言条件跨障分拣 MuJoCo 仿真环境
 
 # ==================== 部署与评测配置区 ====================
-CKPT_PATH = "./ckpt/act_y"  # 待部署的本地 ACT 权重目录（内含 model.safetensors 与 pre/post processor）
+CKPT_PATH = "./ckpt/act_y.bak"  # 待部署的本地 ACT 权重目录（内含 model.safetensors 与 pre/post processor）
 XML_PATH = "./asset/example_scene_y.xml"  # MuJoCo 场景模型 XML 文件路径
 
 NUM_EPISODES = 10  # 连续评测的回合（episode）总数
-MAX_STEPS = 400  # 单个回合最大控制步数（20Hz 下 400 步 = 20 秒），超时判失败并进入下一回合
+MAX_STEPS = 500  # 单个回合最大控制步数（20Hz 下 400 步 = 20 秒），超时判失败并进入下一回合
 SEED = None  # 随机种子：None 表示每回合随机生成物体位置；填整数（如 0）可固定初位复现
 
 # 任务与 OOD 评测配置（与 SimpleEnv.TASKS 对应）：
@@ -31,8 +31,8 @@ OOD_POSITION = False  # True 时扩大物体位置采样范围（测试空间外
 
 # 时序集成（Temporal Ensemble）：每步重推理并加权平滑历史动作块，轨迹更顺滑
 # 若希望直接按训练时的 n_action_steps（如每 10 步推理一次）运行，将其设为 False
-USE_TEMPORAL_ENSEMBLE = True
-TEMPORAL_ENSEMBLE_COEFF = 0.9  # 指数加权系数（仅当 USE_TEMPORAL_ENSEMBLE=True 时生效）
+USE_TEMPORAL_ENSEMBLE = False
+TEMPORAL_ENSEMBLE_COEFF = 0.01  # 指数加权系数（仅当 USE_TEMPORAL_ENSEMBLE=True 时生效）
 # ========================================================
 
 
@@ -59,13 +59,13 @@ def load_act_policy(ckpt_path: str, device: str):
 
 def build_observation(env: SimpleEnv, policy: ACTPolicy, img_transform, device: str):
     """采集当前仿真状态与相机画面，组装为 LeRobot 预处理器所需的观测字典。"""
-    state = env.get_joint_state()[:6]  # 读取 6 维机械臂当前关节角（与采集数据的 observation.state 一致）
+    state = env.get_joint_state()  # 读取 7 维状态：6 关节角 + 夹爪开合（与采集数据的 observation.state 一致）
 
     agent_img, wrist_img = env.grab_image()  # 从 MuJoCo 固定相机抓取主视角与腕部视角 RGB 图像
     agent_tensor = img_transform(Image.fromarray(agent_img).resize((256, 256)))  # 缩放至 256×256 并转为 CHW [0,1] 张量
 
     data = {  # 构造批次维度为 1 的观测字典
-        "observation.state": torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0),  # 形状 (1, 6)
+        "observation.state": torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0),  # 形状 (1, 7)
         "observation.image": agent_tensor.unsqueeze(0).to(device),  # 形状 (1, 3, 256, 256)
     }
 

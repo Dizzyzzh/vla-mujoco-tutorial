@@ -1,4 +1,3 @@
-import copy  # 导入 copy 模块，用于深拷贝关节角数组，避免引用共享导致历史状态被意外覆盖
 import random  # 导入 random 模块，用于在多任务模式下随机抽取自然语言指令
 import glfw  # 导入 GLFW 库，用于读取 MuJoCo 窗口的键盘按键与游戏手柄（Gamepad）状态
 import numpy as np  # 导入 NumPy 数值计算库，用于三维坐标、旋转矩阵和关节角向量运算
@@ -240,7 +239,6 @@ class SimpleEnv:
         self.env.forward(increase_tick=False)  # 刷新前向运动学使所有刚体位置立即生效
 
         # 3. 初始化机械臂控制目标缓存（6 轴臂关节 + 4 轴夹爪关节初始全张开为 0）
-        self.compute_q = copy.deepcopy(q_zero)  # 记录最近一次计算出的 6 轴目标关节角
         self.q = np.concatenate([q_zero, np.array([0.0] * 4)])  # 拼接 10 维执行器目标向量
         self.p0, self.R0 = self.env.get_pR_body(body_name="tcp_link")  # 缓存末端初始位置 p0 与姿态 R0，作为增量遥操作基准
 
@@ -254,15 +252,14 @@ class SimpleEnv:
             [p_apple, p_orange, p_redbull], dtype=np.float32
         )
 
-        # 5. 设置本轮语言指令并清空夹爪状态与分阶段评测标志
+        # 5. 设置本轮语言指令并重置夹爪逻辑状态
         self.set_instruction(given=instruction, task_idx=task_idx)  # 绑定本轮指令与目标物体/托盘
         self.gripper_state = False  # 夹爪初始逻辑状态设为张开（False=0.0, True=1.0）
-        self.past_chars = []  # 预留历史按键缓存列表
         print(f"DONE INITIALIZATION | Task: {self.instruction}")  # 在终端打印本轮任务指令方便操作者查看
 
     def step(self, action):
         """
-        将上层动作指令转换为底层 10 维执行器目标 self.q，并返回指定类型的环境状态。
+        将上层动作指令转换为底层 10 维执行器目标 self.q（无返回值，状态请用 get_joint_state() 读取）。
         args:
             action: 长度为 7 的 NumPy 数组
                 - eef_pose 模式: [dx, dy, dz, droll, dpitch, dyaw, gripper]
@@ -307,10 +304,7 @@ class SimpleEnv:
             ],
             dtype=np.float64,
         )
-        self.compute_q = q  # 保存最新解算出的 6 轴目标关节角
         self.q = np.concatenate([q, gripper_cmd])  # 拼接 6 轴臂关节 + 4 轴夹爪指令为 10 维底层控制量
-
-        return self.get_joint_state()  # 返回 7 维 [j1..j6, gripper]
 
     def step_env(self):
         """将当前控制目标 self.q 写入 MuJoCo 执行器并推进一个物理仿真步长（dt=0.002s）"""

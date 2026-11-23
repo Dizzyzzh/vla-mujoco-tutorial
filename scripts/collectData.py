@@ -9,7 +9,7 @@ from mujoco_env.y_env import SimpleEnv  # 导入多物体语言条件跨障分�
 # ==================== 采集配置区 ====================
 SEED = None  # 随机种子：None 表示每条轨迹随机生成物体坐标（训练推荐）；填整数（如 0）可固定初位调试
 REPO_NAME = "omy_sorting_vla"  # 数据集仓库标识名（需与后续训练配置中的 repo_id 保持一致）
-NUM_COLLECT = 20  # 本次运行计划采集的成功演示轨迹（episode）总条数
+NUM_COLLECT = 50  # 本次运行计划采集的成功演示轨迹（episode）总条数
 XML_PATH = "./asset/example_scene_y.xml"  # MuJoCo 跨障分拣场景主 XML 文件路径
 
 # 任务指令调度模式配置：
@@ -28,7 +28,7 @@ OOD_DISTRACTOR = False  # 是否在左侧抓取区额外放入红牛罐干扰物
 OOD_POSITION = False  # 是否扩大抓取区物体位置随机采样范围
 
 CREATE_NEW_DATASET = True  # True=创建全新数据集目录；False=在 OLD_DATASET_PATH 上断点续录追加轨迹
-OLD_DATASET_PATH = "./data/sorting_data_20261119_000000"  # 仅当 CREATE_NEW_DATASET=False 时生效的旧数据集路径
+OLD_DATASET_PATH = "./dataset/dataset_20261119_000000"  # 仅当 CREATE_NEW_DATASET=False 时生效的旧数据集路径
 # ====================================================
 
 
@@ -41,7 +41,7 @@ def get_next_task_idx(ep_idx, mode):
     return None  # 其他模式（如 "random"）返回 None，交由 SimpleEnv.reset() 随机抽取
 
 
-ROOT = f"./data/sorting_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"  # 拼接带时间戳的新数据集本地保存路径
+ROOT = f"./dataset/dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}"  # 拼接带时间戳的新数据集本地保存路径
 print(f"lerobot version: {lerobot.__version__}")  # 打印当前环境中的 LeRobot 版本号
 
 if CREATE_NEW_DATASET:  # 分支 1：创建全新的 LeRobot 数据集
@@ -62,9 +62,9 @@ if CREATE_NEW_DATASET:  # 分支 1：创建全新的 LeRobot 数据集
                 "shape": (256, 256, 3),  # 高 256、宽 256、RGB 3 通道
                 "names": ["height", "width", "channels"],  # 各维度语义名称
             },
-            "observation.state": {  # 机器人本体状态观测：6 维臂关节角（与 ACT / SmolVLA / Pi0 全部统一）
+            "observation.state": {  # 机器人本体状态观测：6 维臂关节角 + 1 维夹爪状态（与 ACT / SmolVLA / Pi0 全部统一）
                 "dtype": "float32",  # 32 位单精度浮点
-                "shape": (6,),  # 长度 6：[joint1..joint6]
+                "shape": (7,),  # 长度 7：[joint1..joint6, gripper]（gripper：0=张开，1=闭合）
                 "names": ["state"],  # 维度名称
             },
             "action": {  # 监督动作标签：执行 IK 后的 6 维目标关节角 + 1 维夹爪开合指令
@@ -145,7 +145,7 @@ try:  # 使用 try...finally 确保中途关闭窗口或 Ctrl+C 时也能安全�
                     continue  # 跳过本帧写入，直接进入下一循环
 
                 # 1) 在执行本帧动作前采集观测（严格遵循“当前观测 o_t → 执行动作 a_t”的模仿学习时序对齐）
-                obs_joint_state = np.asarray(PnPEnv.get_joint_state()[:6], dtype=np.float32)  # 读取 6 维当前真实关节角
+                obs_joint_state = np.asarray(PnPEnv.get_joint_state(), dtype=np.float32)  # 读取 7 维当前状态：6 关节角 + 夹爪开合
                 agent_image, wrist_image = PnPEnv.grab_image()  # 抓取主视角与腕部视角原始 RGB 图像
                 agent_image = np.asarray(  # 将主视角图像缩放至 256×256 并转为 uint8 数组
                     Image.fromarray(agent_image).resize((256, 256)), dtype=np.uint8
@@ -163,7 +163,7 @@ try:  # 使用 try...finally 确保中途关闭窗口或 Ctrl+C 时也能安全�
                         {
                             "observation.image": agent_image,  # 主视角图像 o_t
                             "observation.wrist_image": wrist_image,  # 腕部视角图像 o_t
-                            "observation.state": obs_joint_state,  # 6 维关节状态 o_t
+                            "observation.state": obs_joint_state,  # 7 维关节+夹爪状态 o_t
                             "action": target_action,  # 7 维目标关节+夹爪动作 a_t
                             "obj_init": np.asarray(PnPEnv.obj_init_pose, dtype=np.float32),  # 9 维物体初位
                             "task": PnPEnv.instruction,  # 当前自然语言任务描述
