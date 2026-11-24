@@ -1,5 +1,4 @@
 import os
-import pyautogui
 import sys
 import time
 import numpy as np
@@ -7,7 +6,6 @@ import numpy as np
 # import shapely as sp
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import tkinter as tk
 import xml.etree.ElementTree as ET
 from scipy.spatial.distance import cdist
 from PIL import Image
@@ -424,11 +422,15 @@ def depth_to_gray_img(depth,max_val=10.0):
     return img
 
 def get_monitor_size():
-    """ 
-        Get monitor size
     """
-    w,h = pyautogui.size()
-    return w,h
+        Get monitor size (falls back to 1920x1080 in headless environments)
+    """
+    try:
+        import pyautogui
+        w, h = pyautogui.size()
+        return w, h
+    except Exception:
+        return 1920, 1080
     
 def get_xml_string_from_path(xml_path):
     # Parse the XML file
