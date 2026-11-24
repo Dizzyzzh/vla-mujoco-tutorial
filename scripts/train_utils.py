@@ -108,13 +108,12 @@ class VisualAugmentor:
         return self.color_jitter > 0 or self.noise_std > 0 or self.erasing_prob > 0
 
     def _augment_tensor(self, img: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-        squeezed = False
-        if img.ndim == 3:
-            img = img.unsqueeze(0)
-            squeezed = True
-
-        out = img.clone()
-        bsz, _, height, width = out.shape
+        if img.ndim < 3:
+            raise ValueError(f"Expected image tensor with ndim >= 3, got shape {tuple(img.shape)}")
+        orig_shape = img.shape
+        channels, height, width = orig_shape[-3:]
+        out = img.reshape(-1, channels, height, width).clone()
+        bsz = out.shape[0]
         device, dtype = out.device, out.dtype
 
         jitter = self.color_jitter * scale
@@ -162,7 +161,7 @@ class VisualAugmentor:
                     out[b, :, top : top + eh, left : left + ew] = fill
 
         out.clamp_(0.0, 1.0)
-        return out.squeeze(0) if squeezed else out
+        return out.reshape(orig_shape)
 
     def __call__(self, batch: dict) -> dict:
         if not self.enabled:
