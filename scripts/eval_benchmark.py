@@ -243,6 +243,37 @@ def build_observation(
     return data, agent_img, wrist_img
 
 
+def pop_cached_action(policy, policy_type: str):
+    """
+    当动作块队列非空且策略无需逐帧更新历史观测窗口时，直接弹出下一缓存动作，
+    避免无界面批测在队列命中步重复执行离屏渲染与分词（与完整调用动作输出完全等价）。
+    """
+    raw_policy = getattr(policy, "_orig_mod", policy)
+    cfg = raw_policy.config
+    if policy_type == "smolvla":
+        if (
+            getattr(cfg, "n_obs_steps", 1) == 1
+            and not raw_policy._rtc_enabled()
+            and len(raw_policy._queues.get("action", ())) > 0
+        ):
+            return raw_policy._queues["action"].popleft()
+    elif policy_type == "act":
+        if (
+            getattr(cfg, "temporal_ensemble_coeff", None) is None
+            and len(raw_policy._action_queue) > 0
+        ):
+            return raw_policy._action_queue.popleft()
+    elif policy_type == "pi05":
+        if (
+            not getattr(cfg, "use_visual_memory", False)
+            and not getattr(cfg, "use_proprioceptive_memory", False)
+            and not raw_policy._rtc_enabled()
+            and len(raw_policy._action_queue) > 0
+        ):
+            return raw_policy._action_queue.popleft()
+    return None
+
+
 def compose_dual_view_frame(
     agent_img: np.ndarray,
     wrist_img: np.ndarray,
@@ -581,24 +612,37 @@ def main() -> None:
                             steps_taken = step + 1
                             break
                     else:
-                        data, agent_img, wrist_img = build_observation(
-                            env, policy_type, policy, img_transform, device, include_side=args.gui
+                        agent_img = wrist_img = None
+                        cached_action = (
+                            None
+                            if (record_video or args.gui)
+                            else pop_cached_action(policy, policy_type)
                         )
-                        if is_cuda:
-                            torch.cuda.synchronize()
-                        t0 = time.perf_counter()
-                        with torch.inference_mode():
-                            inp_batch = preprocessor(data)
-                            if use_autocast:
-                                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                        if cached_action is not None:
+                            t0 = time.perf_counter()
+                            with torch.inference_mode():
+                                action = postprocessor(cached_action)
+                            step_latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                            action_np = action[0].detach().float().cpu().numpy()
+                        else:
+                            data, agent_img, wrist_img = build_observation(
+                                env, policy_type, policy, img_transform, device, include_side=args.gui
+                            )
+                            if is_cuda:
+                                torch.cuda.synchronize()
+                            t0 = time.perf_counter()
+                            with torch.inference_mode():
+                                inp_batch = preprocessor(data)
+                                if use_autocast:
+                                    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                                        action = policy.select_action(inp_batch)
+                                else:
                                     action = policy.select_action(inp_batch)
-                            else:
-                                action = policy.select_action(inp_batch)
-                            action = postprocessor(action)
-                        if is_cuda:
-                            torch.cuda.synchronize()
-                        step_latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-                        action_np = action[0].detach().float().cpu().numpy()
+                                action = postprocessor(action)
+                            if is_cuda:
+                                torch.cuda.synchronize()
+                            step_latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                            action_np = action[0].detach().float().cpu().numpy()
 
                     env.step(action_np)
                     for _ in range(substeps):
