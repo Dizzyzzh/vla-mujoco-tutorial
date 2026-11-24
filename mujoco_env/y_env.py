@@ -1,5 +1,6 @@
 import random  # 导入 random 模块，用于在多任务模式下随机抽取自然语言指令
 import glfw  # 导入 GLFW 库，用于读取 MuJoCo 窗口的键盘按键与游戏手柄（Gamepad）状态
+import mujoco  # 导入 MuJoCo 原生库，用于无界面离屏渲染与底层接触碰撞检测
 import numpy as np  # 导入 NumPy 数值计算库，用于三维坐标、旋转矩阵和关节角向量运算
 
 from mujoco_env.ik import solve_ik  # 导入逆运动学（IK）求解器，将末端目标位姿解算为 6 轴关节角
@@ -54,6 +55,13 @@ class SimpleEnv:
     # 关闭 OOD 干扰物模式时，将红牛罐停放到所有相机视野之外的地面安全坐标 [x, y, z]
     DISTRACTOR_PARK_POS = np.array([-1.50, 0.0, 0.05], dtype=np.float64)
 
+    # 动态物体刚体名到实际碰撞/视觉几何体名的映射（用于精确读取三维中心坐标）
+    OBJ_GEOM_MAP = {
+        "body_obj_apple": "geom_obj_apple",
+        "body_obj_orange": "geom_obj_orange",
+        "body_obj_redbull": "geom_obj_redbull",
+    }
+
     def __init__(  # 环境初始化方法
         self,
         xml_path,  # MuJoCo 场景主 XML 文件路径
@@ -63,14 +71,27 @@ class SimpleEnv:
         ood_distractor=False,  # 是否默认开启 OOD 干扰物（红牛罐）
         ood_position=False,  # 是否默认开启 OOD 扩展位置采样范围
         headless=False,  # 是否以无界面模式运行（True 时不弹 GLFW 窗口，适合批测与脚本验证）
+        verbose=True,  # 是否打印底层模型信息与每次 reset 日志
     ):
         # 加载 MuJoCo XML 模型并创建底层仿真解析器实例
-        self.env = MuJoCoParserClass(name="LanguageObstacleSorting", rel_xml_path=xml_path)
+        self.env = MuJoCoParserClass(
+            name="LanguageObstacleSorting", rel_xml_path=xml_path, verbose=verbose
+        )
         self.action_type = action_type  # 保存动作控制模式
         self.default_task_idx = task_idx  # 保存默认任务索引
         self.ood_distractor = ood_distractor  # 保存默认 OOD 干扰物开关
         self.ood_position = ood_position  # 保存默认 OOD 位置扩展开关
         self.headless = headless  # 保存无界面模式标志
+        self.verbose = verbose  # 保存日志开关标志
+        self._offscreen_renderer = None  # 无界面模式下使用的 MuJoCo 离屏渲染器句柄
+
+        # 缓存隔板几何体与静态支撑体 ID，供高频碰撞检测使用
+        self._barrier_geom_id = self.env.model.geom("barrier_wall").id
+        self._static_body_ids = {
+            0,
+            self.env.model.body("front_object_table").id,
+            self.env.model.body("sorting_barrier").id,
+        }
 
         self.joint_names = [  # OpenManipulator-Y 机械臂 6 个旋转关节的名称列表（与 omy.xml 保持一致）
             "joint1",  # 底座回转关节（绕 Z 轴）
@@ -89,8 +110,16 @@ class SimpleEnv:
 
         if not self.headless:  # 若处于可视化交互模式
             self.init_viewer()  # 初始化 MuJoCo 交互渲染窗口与观察视角
-        else:  # 若处于无界面模式（自动化验证 / 离线批测）
+        else:  # 若处于无界面模式（自动化数据生成 / 离线批测）
             self.env.reset()  # 仅重置底层仿真数据结构，不创建图形窗口
+            # 创建与 XML 默认 offwidth/offheight (640x480) 一致的离屏渲染器
+            self._offscreen_renderer = mujoco.Renderer(
+                self.env.model, height=480, width=640
+            )
+            # 关闭天空盒以与可视化窗口 black_sky=True 保持视觉一致
+            self._offscreen_renderer.scene.flags[
+                mujoco.mjtRndFlag.mjRND_SKYBOX
+            ] = False
 
         self.reset(  # 执行首次环境重置：归位机械臂、摆放物体并设定初始语言指令
             seed=seed,  # 传入初始随机种子
@@ -255,7 +284,8 @@ class SimpleEnv:
         # 5. 设置本轮语言指令并重置夹爪逻辑状态
         self.set_instruction(given=instruction, task_idx=task_idx)  # 绑定本轮指令与目标物体/托盘
         self.gripper_state = False  # 夹爪初始逻辑状态设为张开（False=0.0, True=1.0）
-        print(f"DONE INITIALIZATION | Task: {self.instruction}")  # 在终端打印本轮任务指令方便操作者查看
+        if self.verbose:
+            print(f"DONE INITIALIZATION | Task: {self.instruction}")  # 在终端打印本轮任务指令方便操作者查看
 
     def step(self, action):
         """
@@ -310,12 +340,43 @@ class SimpleEnv:
         """将当前控制目标 self.q 写入 MuJoCo 执行器并推进一个物理仿真步长（dt=0.002s）"""
         self.env.step(self.q)  # 底层执行一次 mj_step
 
-    def grab_image(self):
-        """从场景中的 3 个固定相机渲染抓取 RGB 图像，返回主视角与腕部视角"""
+    def _render_offscreen_cam(self, cam_name: str):
+        """使用 MuJoCo 离屏渲染器抓取指定固定相机画面，并保持黑背景设置一致"""
+        self._offscreen_renderer.update_scene(self.env.data, camera=cam_name)
+        self._offscreen_renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
+        return self._offscreen_renderer.render().copy()
+
+    def grab_image(self, include_side=None):
+        """从场景中的固定相机渲染抓取 RGB 图像，返回主视角与腕部视角"""
+        if include_side is None:
+            include_side = not self.headless
+
+        if self.headless:
+            if self._offscreen_renderer is None:
+                self._offscreen_renderer = mujoco.Renderer(
+                    self.env.model, height=480, width=640
+                )
+            self.rgb_agent = self._render_offscreen_cam("agentview")
+            self.rgb_ego = self._render_offscreen_cam("egocentric")
+            self.rgb_side = (
+                self._render_offscreen_cam("sideview") if include_side else None
+            )
+            return self.rgb_agent, self.rgb_ego
+
         self.rgb_agent = self.env.get_fixed_cam_rgb(cam_name="agentview")  # 抓取第三人称主视角图像
         self.rgb_ego = self.env.get_fixed_cam_rgb(cam_name="egocentric")  # 抓取腕部第一人称视角图像
-        self.rgb_side = self.env.get_fixed_cam_rgb(cam_name="sideview")  # 抓取侧面辅助视角图像（供遥操作显示）
+        self.rgb_side = (  # 抓取侧面辅助视角图像（供遥操作显示）
+            self.env.get_fixed_cam_rgb(cam_name="sideview") if include_side else None
+        )
         return self.rgb_agent, self.rgb_ego  # 返回策略训练/推理所需的两路视角
+
+    def close(self):
+        """统一释放离屏渲染器或交互式 GLFW 渲染窗口资源"""
+        if getattr(self, "_offscreen_renderer", None) is not None:
+            self._offscreen_renderer.close()
+            self._offscreen_renderer = None
+        elif getattr(self.env, "use_mujoco_viewer", False):
+            self.env.close_viewer()
 
     def render(self, teleop=False, idx=None):
         """渲染 MuJoCo 可视化窗口，并绘制末端指示器、多路相机小窗以及任务/手柄文字提示"""
@@ -573,6 +634,52 @@ class SimpleEnv:
             return False
 
         return True  # 所有条件满足，判定本次演示/评测成功
+
+    def get_obj_geom_center(self, body_name: str) -> np.ndarray:
+        """读取物体实际几何体（geom）的世界三维中心坐标，避免网格偏移与底部原点误差"""
+        geom_name = self.OBJ_GEOM_MAP.get(body_name)
+        if geom_name is not None:
+            return self.env.data.geom(geom_name).xpos.copy()
+        return self.env.get_p_body(body_name).copy()
+
+    def check_barrier_collision(self) -> bool:
+        """检测机械臂或任意动态物体是否与中间隔板（barrier_wall）发生物理接触"""
+        for i in range(self.env.data.ncon):
+            c = self.env.data.contact[i]
+            if c.geom1 == self._barrier_geom_id:
+                other_geom = c.geom2
+            elif c.geom2 == self._barrier_geom_id:
+                other_geom = c.geom1
+            else:
+                continue
+            other_body = int(self.env.model.geom_bodyid[other_geom])
+            if other_body not in self._static_body_ids:
+                return True
+        return False
+
+    def get_eval_diagnostics(self) -> dict:
+        """读取细粒度分阶段评测状态，用于抓取/跨障/放盘阶段统计与失败归因分析"""
+        other_tray = "tray_green" if self.tray_target == "tray_blue" else "tray_blue"
+        p_target_body = self.env.get_p_body(self.obj_target)
+        p_other_body = self.env.get_p_body(self.obj_other)
+        p_target_geom = self.get_obj_geom_center(self.obj_target)
+        p_redbull_body = self.env.get_p_body("body_obj_redbull")
+        p_tcp = self.env.get_p_body("tcp_link")
+        redbull_active = bool(p_redbull_body[0] > -0.5)
+        return {
+            "tcp_z": float(p_tcp[2]),
+            "tcp_to_target_xy": float(np.linalg.norm(p_tcp[:2] - p_target_geom[:2])),
+            "target_z": float(p_target_body[2]),
+            "target_y": float(p_target_body[1]),
+            "other_z": float(p_other_body[2]),
+            "redbull_active": redbull_active,
+            "redbull_z": float(p_redbull_body[2]) if redbull_active else 0.0,
+            "target_in_target_tray": bool(self._is_in_tray(p_target_body, self.tray_target)),
+            "target_in_wrong_tray": bool(self._is_in_tray(p_target_body, other_tray)),
+            "other_in_target_tray": bool(self._is_in_tray(p_other_body, self.tray_target)),
+            "other_in_wrong_tray": bool(self._is_in_tray(p_other_body, other_tray)),
+            "success": bool(self.check_success()),
+        }
 
     def get_obj_pose(self):
         """读取并返回苹果、橙子、红牛罐当前的三维世界坐标"""

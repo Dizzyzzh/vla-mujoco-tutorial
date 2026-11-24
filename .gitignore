@@ -10,3 +10,4 @@ omy_pnp_language
 __pycache__/
 .vscode/*
 *.egg-info/
+eval_results
