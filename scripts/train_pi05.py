@@ -1,166 +1,173 @@
-import argparse  # 用于解析命令行开关参数
-from contextlib import nullcontext  # 用于按需启用混合精度上下文
-from pathlib import Path  # 用于跨平台路径拼接与目录创建
-from typing import Optional  # 可选类型标注
+import argparse
+import time
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Optional
 
-import matplotlib.pyplot as plt  # 用于绘制预测动作与真值动作的对比曲线
-import torch  # PyTorch 深度学习框架
+import torch
+from lerobot.configs.types import FeatureType
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.utils.feature_utils import dataset_to_policy_features
 
-from lerobot.configs.types import FeatureType  # 特征类型枚举（如 ACTION、STATE、VISUAL 等）
-from lerobot.datasets.factory import resolve_delta_timestamps  # 根据策略配置解析动作窗口的时间偏移量
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata  # 数据集本体与元信息加载类
-from lerobot.policies.factory import make_pre_post_processors  # LeRobot 0.7.0 预处理/后处理器工厂函数
-from lerobot.policies.pi05.configuration_pi05 import PI05Config  # PI0.5 配置类
-from lerobot.policies.pi05.modeling_pi05 import PI05Policy  # PI0.5 策略模型类
-from lerobot.utils.feature_utils import dataset_to_policy_features  # 将数据集特征格式转换为策略所需特征字典
-
-# ==================== 默认训练配置（可直接修改） ====================
-repo_id = "omy_pnp_language"  # 数据集 repo_id
-dataset_root = "./demo_data_language"  # 本地数据集根目录
-output_dir = Path("./ckpt/pi05_omy")  # 模型与处理器权重保存目录
-pretrained_path: Optional[str] = "lerobot/pi05_base"  # 预训练权重或本地 checkpoint（后训练可直接改成本地目录）
-
-chunk_size = 5  # 每次前向预测的动作块长度
-n_action_steps = 5  # 推理时每次连续执行的动作步数
-batch_size = 8  # 每个训练批次样本数（PI0.5 显存需求较大，按显存调整）
-training_steps = 20000  # 总训练迭代步数
-log_freq = 50  # 每隔 50 步打印一次训练日志
-save_freq = 10000  # 每隔 10000 步保存一次中间 checkpoint（0 表示仅训练结束保存）
-grad_clip_norm = 1.0  # 梯度裁剪最大范数（<=0 表示不裁剪）
-target_loss: Optional[float] = None  # 目标 loss 阈值（例如改为 0.02 做早停；None 表示关闭）
-
-# PI0.5 微调与显存控制
-dtype = torch.bfloat16  # 权重精度（可选 torch.bfloat16 或 torch.float32）
-gradient_checkpointing = True  # 开启梯度检查点大幅降低显存占用
-freeze_vision_encoder = False  # 是否仅冻结视觉编码器
-train_expert_only = False  # 是否冻结 VLM 主干，仅训练动作专家与投影层
-use_amp = False  # 是否开启 torch.autocast 自动混合精度
-
-# 模型评估开关配置
-enable_eval = True  # True=训练完成后执行离线开环推理评估；False=关闭评估
-eval_episode_index = 0  # 评估时使用的轨迹编号（从 0 开始）
-eval_show_plot = True  # 是否弹出预测动作与真值动作对比曲线窗口（无图形界面环境可设为 False）
-eval_save_plot = True  # 是否将评估对比图保存至 output_dir 目录
-
-
-def save_artifacts(save_dir: Path, policy: PI05Policy, preprocessor, postprocessor) -> None:
-    """保存模型权重配置以及 pre/post processor（部署时反归一化必需）。"""
-    save_dir.mkdir(parents=True, exist_ok=True)
-    policy.save_pretrained(save_dir)
-    preprocessor.save_pretrained(save_dir)
-    postprocessor.save_pretrained(save_dir)
-
-
-class EpisodeSampler(torch.utils.data.Sampler):
-    """按时间顺序采样指定 episode 的所有帧索引，用于离线开环评估。"""
-
-    def __init__(self, dataset: LeRobotDataset, episode_index: int):
-        ep = dataset.meta.episodes[episode_index]
-        from_idx = int(ep["dataset_from_index"])
-        to_idx = int(ep["dataset_to_index"])
-        self.frame_ids = range(from_idx, to_idx)
-
-    def __iter__(self):
-        return iter(self.frame_ids)
-
-    def __len__(self) -> int:
-        return len(self.frame_ids)
-
-
-def evaluate_policy(
-    policy: PI05Policy,
-    dataset: LeRobotDataset,
-    preprocessor,
-    postprocessor,
-    device: torch.device,
-    episode_index: int = 0,
-    show_plot: bool = True,
-    save_plot_path: Optional[Path] = None,
-) -> float:
-    """对指定 episode 执行离线开环推理评估，并按需可视化或保存对比图。"""
-    policy.eval()
-    policy.reset()
-    actions = []
-    gt_actions = []
-
-    episode_sampler = EpisodeSampler(dataset, episode_index=episode_index)
-    test_dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=0,
-        batch_size=1,
-        shuffle=False,
-        pin_memory=device.type != "cpu",
-        sampler=episode_sampler,
+try:
+    from scripts.train_utils import (
+        MetricsLogger,
+        VisualAugmentor,
+        build_warmup_cosine_scheduler,
+        count_parameters,
+        evaluate_heldout_mae,
+        save_artifacts,
+        set_seed,
+        split_train_val_episodes,
     )
-
-    with torch.no_grad():
-        for batch in test_dataloader:
-            gt_action = batch["action"][:, 0, :] if batch["action"].ndim == 3 else batch["action"]
-            gt_actions.append(gt_action.cpu())
-            inp_batch = preprocessor(batch)  # 完成状态/动作分位数归一化、语言分词并迁移至计算设备
-            pred_action = policy.select_action(inp_batch)
-            pred_action = postprocessor(pred_action)  # 反归一化回原始物理尺度
-            actions.append(pred_action.cpu())
-
-    actions = torch.cat(actions, dim=0)
-    gt_actions = torch.cat(gt_actions, dim=0)
-    mean_action_error = torch.mean(torch.abs(actions - gt_actions)).item()
-    print(f"[Eval] Episode {episode_index} Mean action error: {mean_action_error:.3f}")
-
-    if show_plot or save_plot_path is not None:
-        action_dim = actions.shape[-1]
-        fig, axs = plt.subplots(action_dim, 1, figsize=(10, 10))
-        if action_dim == 1:
-            axs = [axs]
-        for i in range(action_dim):
-            axs[i].plot(actions[:, i].numpy(), label="pred")
-            axs[i].plot(gt_actions[:, i].numpy(), label="gt")
-            axs[i].legend()
-        plt.tight_layout()
-        if save_plot_path is not None:
-            plt.savefig(save_plot_path, dpi=150)
-            print(f"[Eval] Saved evaluation plot to: {save_plot_path}")
-        if show_plot:
-            plt.show()
-        else:
-            plt.close(fig)
-
-    return mean_action_error
+except ImportError:
+    from train_utils import (
+        MetricsLogger,
+        VisualAugmentor,
+        build_warmup_cosine_scheduler,
+        count_parameters,
+        evaluate_heldout_mae,
+        save_artifacts,
+        set_seed,
+        split_train_val_episodes,
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="训练或后训练 PI0.5 策略并按需执行离线开环评估")
-    parser.add_argument("--pretrained-path", type=str, default=pretrained_path, help="预训练权重或本地 checkpoint 路径")
-    parser.add_argument("--no-pretrained", action="store_true", help="强制从头初始化训练，不加载预训练权重")
-    parser.add_argument("--dataset-root", type=str, default=dataset_root, help="本地数据集根目录")
-    parser.add_argument("--repo-id", type=str, default=repo_id, help="数据集 repo_id")
-    parser.add_argument("--output-dir", type=str, default=str(output_dir), help="模型与处理器权重保存目录")
-    parser.add_argument("--steps", type=int, default=training_steps, help="总训练迭代步数")
-    parser.add_argument("--batch-size", type=int, default=batch_size, help="训练批次大小")
-    parser.add_argument("--lr", type=float, default=None, help="覆盖 PI05Config 默认学习率")
+    parser = argparse.ArgumentParser(
+        description="微调或后训练 PI0.5 策略（支持梯度检查点、梯度累积、Warmup+Cosine、视觉增强与无泄露验证）"
+    )
+    parser.add_argument(
+        "--pretrained-path",
+        type=str,
+        default="lerobot/pi05_base",
+        help="预训练权重或本地 checkpoint 路径（数据回流续训可直接传本地目录）",
+    )
+    parser.add_argument("--no-pretrained", action="store_true", help="强制从头初始化，不加载预训练权重")
+    parser.add_argument("--repo-id", type=str, default="omy_sorting_vla", help="数据集仓库标识名")
+    parser.add_argument("--dataset-root", type=str, default="./dataset/smolvla_dataset", help="本地数据集根目录")
+    parser.add_argument("--output-dir", type=str, default="./ckpt/pi05_baseline", help="模型与日志保存目录")
+
+    parser.add_argument("--chunk-size", type=int, default=5, help="每次预测的动作块长度")
+    parser.add_argument("--n-action-steps", type=int, default=5, help="推理时每次连续执行的动作步数")
+    parser.add_argument("--steps", type=int, default=20000, help="总优化器更新步数")
+    parser.add_argument("--batch-size", type=int, default=2, help="单次前向微批次大小（PI0.5 显存需求较大，建议 1~4）")
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=8,
+        help="梯度累积步数（默认 2x8=16 等效 batch，兼顾显存与收敛稳定性）",
+    )
+    parser.add_argument("--lr", type=float, default=None, help="覆盖 PI05Config 默认学习率（默认 2.5e-5）")
+    parser.add_argument("--warmup-steps", type=int, default=500, help="线性 Warmup 步数")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1, help="余弦退火最低学习率比例")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="梯度裁剪最大范数（<=0 关闭）")
+
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["float32", "bfloat16"],
-        default=str(dtype).removeprefix("torch."),
-        help="模型权重精度配置",
+        choices=["bfloat16", "float32"],
+        default="bfloat16",
+        help="模型权重精度配置（Ampere 及以上 GPU 推荐 bfloat16；不支持 bf16 时请用 float32）",
     )
-    parser.add_argument("--target-loss", type=float, default=target_loss, help="当 loss <= 该值时提前停止训练并保存")
-    parser.add_argument("--eval", dest="enable_eval", action="store_true", default=enable_eval, help="开启训练后模型评估")
-    parser.add_argument("--no-eval", dest="enable_eval", action="store_false", help="关闭训练后模型评估")
-    parser.add_argument("--eval-episode", type=int, default=eval_episode_index, help="评估使用的 episode 编号")
-    parser.add_argument("--no-plot", dest="eval_show_plot", action="store_false", default=eval_show_plot, help="关闭评估曲线弹窗")
-    parser.add_argument("--save-eval-plot", dest="eval_save_plot", action="store_true", default=eval_save_plot, help="保存评估对比图")
+    parser.add_argument("--amp", dest="use_amp", action="store_true", default=False, help="开启 torch.autocast 自动混合精度")
+    parser.add_argument("--no-amp", dest="use_amp", action="store_false", help="关闭自动混合精度（默认关闭，优先用 --dtype bfloat16）")
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["fp16", "bf16"],
+        default="bf16",
+        help="autocast 混合精度类型",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        default=True,
+        help="开启梯度检查点大幅降低激活显存（默认开启）",
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="关闭梯度检查点以换取更快前向/反向速度",
+    )
+    parser.add_argument(
+        "--freeze-vision-encoder",
+        dest="freeze_vision_encoder",
+        action="store_true",
+        default=True,
+        help="冻结视觉编码器（默认开启）",
+    )
+    parser.add_argument(
+        "--no-freeze-vision-encoder",
+        dest="freeze_vision_encoder",
+        action="store_false",
+        help="解冻视觉编码器联合微调",
+    )
+    parser.add_argument(
+        "--train-expert-only",
+        dest="train_expert_only",
+        action="store_true",
+        default=True,
+        help="冻结 VLM 主干仅训练动作专家与投影层（默认开启，防止小样本破坏语言理解）",
+    )
+    parser.add_argument(
+        "--no-train-expert-only",
+        dest="train_expert_only",
+        action="store_false",
+        help="解冻 VLM 主干联合微调（用于对比全参微调的语言遗忘现象）",
+    )
+
+    parser.add_argument("--save-freq", type=int, default=5000, help="定期保存中间 checkpoint 间隔步数（0 关闭）")
+    parser.add_argument("--log-freq", type=int, default=50, help="日志打印与指标落盘间隔步数")
+    parser.add_argument("--val-episodes", type=int, default=4, help="留出最后 N 条轨迹作为无泄露开环验证集")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader 进程数（Windows 建议保持 0，Linux 可设为 4~8）")
+    parser.add_argument("--target-loss", type=float, default=None, help="可选：EMA loss <= 该阈值时提前停止（默认关闭）")
+
+    # 视觉数据增强（提升抗干扰物与光照偏移鲁棒性）
+    parser.add_argument(
+        "--image-aug",
+        action="store_true",
+        help="一键开启推荐视觉增强（color_jitter=0.2, noise_std=0.02, erasing_prob=0.15）",
+    )
+    parser.add_argument("--aug-color-jitter", type=float, default=0.0, help="主视角亮度/对比度/饱和度抖动幅度")
+    parser.add_argument("--aug-noise-std", type=float, default=0.0, help="主视角高斯噪声标准差")
+    parser.add_argument("--aug-erasing-prob", type=float, default=0.0, help="随机遮挡擦除概率")
+    parser.add_argument("--aug-wrist", action="store_true", help="同时对腕部相机施加 0.5x 轻度增强")
+
+    # 训练后离线评估开关（默认无弹窗保存图片，兼容无界面服务器）
+    parser.add_argument("--eval", dest="enable_eval", action="store_true", default=True, help="开启训练后开环验证")
+    parser.add_argument("--no-eval", dest="enable_eval", action="store_false", help="关闭训练后开环验证")
+    parser.add_argument("--eval-episode", type=int, default=0, help="当 val-episodes=0 时指定评估的轨迹编号")
+    parser.add_argument("--eval-show-plot", action="store_true", default=False, help="是否弹窗展示评估曲线")
+    parser.add_argument("--no-plot", dest="eval_show_plot", action="store_false", help="关闭评估曲线弹窗（默认已关闭）")
+    parser.add_argument("--save-eval-plot", dest="eval_save_plot", action="store_true", default=True, help="保存评估对比图")
+    parser.add_argument("--no-save-eval-plot", dest="eval_save_plot", action="store_false", help="不保存评估对比图")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     save_dir = Path(args.output_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     active_pretrained = None if args.no_pretrained else args.pretrained_path
-    model_dtype = getattr(torch, args.dtype)
+
+    if args.dtype == "bfloat16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        print("[Warn] 当前 GPU 不支持原生 bfloat16，自动回退至 float32 + FP16 AMP。")
+        model_dtype = torch.float32
+        args.use_amp = True
+        args.amp_dtype = "fp16"
+    else:
+        model_dtype = getattr(torch, args.dtype)
 
     # 1. 读取数据集元信息并构建输入/输出特征
     dataset_metadata = LeRobotDatasetMetadata(args.repo_id, root=args.dataset_root)
@@ -170,29 +177,28 @@ def main() -> None:
 
     # 2. 构建 PI0.5 配置并实例化策略模型
     if active_pretrained:
-        # 先加载预训练配置以保留 PaliGemma / Gemma Expert 变体等结构超参，再覆盖当前任务参数
         cfg = PI05Config.from_pretrained(active_pretrained)
         cfg.input_features = input_features
         cfg.output_features = output_features
-        cfg.chunk_size = chunk_size
-        cfg.n_action_steps = n_action_steps
+        cfg.chunk_size = args.chunk_size
+        cfg.n_action_steps = args.n_action_steps
         cfg.device = device.type
         cfg.dtype = model_dtype
-        cfg.gradient_checkpointing = gradient_checkpointing
-        cfg.freeze_vision_encoder = freeze_vision_encoder
-        cfg.train_expert_only = train_expert_only
+        cfg.gradient_checkpointing = args.gradient_checkpointing
+        cfg.freeze_vision_encoder = args.freeze_vision_encoder
+        cfg.train_expert_only = args.train_expert_only
         policy = PI05Policy.from_pretrained(active_pretrained, config=cfg)
     else:
         cfg = PI05Config(
             input_features=input_features,
             output_features=output_features,
-            chunk_size=chunk_size,
-            n_action_steps=n_action_steps,
+            chunk_size=args.chunk_size,
+            n_action_steps=args.n_action_steps,
             device=device.type,
             dtype=model_dtype,
-            gradient_checkpointing=gradient_checkpointing,
-            freeze_vision_encoder=freeze_vision_encoder,
-            train_expert_only=train_expert_only,
+            gradient_checkpointing=args.gradient_checkpointing,
+            freeze_vision_encoder=args.freeze_vision_encoder,
+            train_expert_only=args.train_expert_only,
         )
         policy = PI05Policy(cfg)
 
@@ -200,14 +206,36 @@ def main() -> None:
     policy.to(device)
     delta_timestamps = resolve_delta_timestamps(cfg, dataset_metadata)
 
-    # PI05Config 默认使用分位数归一化（QUANTILES），此处传入当前数据集统计量生成对应处理器
+    # PI05Config 默认使用分位数归一化（QUANTILES），基于当前本地数据集统计量生成处理器
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg,
         dataset_stats=dataset_metadata.stats,
     )
 
-    # 3. 加载数据集、可训练参数优化器与 DataLoader（可在此前自由挂载 LoRA 或自定义冻层）
-    dataset = LeRobotDataset(args.repo_id, delta_timestamps=delta_timestamps, root=args.dataset_root)
+    # 3. 加载数据集并按 episode 划分训练/验证集
+    full_dataset = LeRobotDataset(
+        args.repo_id, delta_timestamps=delta_timestamps, root=args.dataset_root
+    )
+    train_dataset, val_ep_ids = split_train_val_episodes(full_dataset, args.val_episodes)
+    dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=device.type != "cpu",
+        drop_last=True,
+    )
+
+    cj = max(args.aug_color_jitter, 0.2) if args.image_aug else args.aug_color_jitter
+    ns = max(args.aug_noise_std, 0.02) if args.image_aug else args.aug_noise_std
+    ep_prob = max(args.aug_erasing_prob, 0.15) if args.image_aug else args.aug_erasing_prob
+    augmentor = VisualAugmentor(
+        color_jitter=cj,
+        noise_std=ns,
+        erasing_prob=ep_prob,
+        augment_wrist=args.aug_wrist,
+    )
+
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
     lr = args.lr if args.lr is not None else cfg.optimizer_lr
     optimizer = torch.optim.AdamW(
@@ -217,76 +245,157 @@ def main() -> None:
         eps=cfg.optimizer_eps,
         weight_decay=cfg.optimizer_weight_decay,
     )
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,  # Windows 下建议保持 0，避免多进程问题
-        pin_memory=device.type != "cpu",
-        drop_last=True,
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer=optimizer,
+        total_steps=args.steps,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
     )
 
-    amp_enabled = use_amp and device.type == "cuda"
-    amp_dtype = torch.bfloat16 if model_dtype == torch.bfloat16 else torch.float16
-    # bfloat16 无需 GradScaler；仅 float16 混合精度时启用梯度缩放
-    grad_scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled and amp_dtype == torch.float16)
+    amp_enabled = args.use_amp and device.type == "cuda"
+    amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
+    grad_scaler = torch.amp.GradScaler(
+        device.type, enabled=amp_enabled and amp_dtype == torch.float16
+    )
+    metrics_logger = MetricsLogger(save_dir)
+
+    n_train_params, n_total_params = count_parameters(policy)
+    eff_batch = args.batch_size * args.grad_accum_steps
     print(
-        f"[Train PI0.5] pretrained={active_pretrained}, dtype={args.dtype}, "
-        f"steps={args.steps}, batch_size={args.batch_size}, lr={lr}"
+        f"[Train PI0.5] pretrained={active_pretrained}, device={device.type}, "
+        f"dtype={str(model_dtype).removeprefix('torch.')}, amp={amp_enabled}({args.amp_dtype if amp_enabled else 'off'}), "
+        f"grad_ckpt={args.gradient_checkpointing}, freeze_vision={args.freeze_vision_encoder}, expert_only={args.train_expert_only}, "
+        f"params={n_train_params / 1e6:.2f}M/{n_total_params / 1e6:.2f}M, "
+        f"train_eps={dataset_metadata.total_episodes - len(val_ep_ids)}/{dataset_metadata.total_episodes}, "
+        f"val_eps={val_ep_ids}, steps={args.steps}, batch={args.batch_size}x{args.grad_accum_steps}={eff_batch}, "
+        f"lr={lr}, aug=(cj={cj}, noise={ns}, erase={ep_prob})"
     )
 
-    # 4. 训练循环（后训练可改 reduction="none" 实现逐样本加权或自定义 Loss）
-    step = 0
-    done = False
-    while not done:
-        for batch in dataloader:
+    # 4. 训练循环（后训练提示：可改 reduction="none" 实现逐样本加权或自定义 Flow Matching Loss）
+    data_iter = iter(dataloader)
+
+    def next_batch():
+        nonlocal data_iter
+        try:
+            return next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            return next(data_iter)
+
+    ema_loss: Optional[float] = None
+    ema_alpha = 0.05
+    best_ema_loss = float("inf")
+    best_check_freq = min(250, max(args.log_freq, args.steps // 5, 1))
+    warmup_gate = min(args.warmup_steps, max(1, args.steps // 2))
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    for step in range(1, args.steps + 1):
+        t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        accum_loss = 0.0
+
+        for _ in range(args.grad_accum_steps):
+            batch = next_batch()
+            batch = augmentor(batch)
             inp_batch = preprocessor(batch)
-            autocast_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_enabled else nullcontext()
+            autocast_ctx = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_enabled
+                else nullcontext()
+            )
             with autocast_ctx:
-                loss, _ = policy.forward(inp_batch)  # 如需逐样本 Reward 加权，可改为 reduction="none"
+                raw_loss, _ = policy.forward(inp_batch)
+                scaled_loss = raw_loss / args.grad_accum_steps
 
-            grad_scaler.scale(loss).backward()
-            if grad_clip_norm > 0:
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip_norm)
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-            optimizer.zero_grad()
+            grad_scaler.scale(scaled_loss).backward()
+            accum_loss += float(raw_loss.detach().item()) / args.grad_accum_steps
 
-            loss_val = loss.item()
-            if step % log_freq == 0:
-                print(f"step: {step} loss: {loss_val:.3f}")
+        grad_scaler.unscale_(optimizer)
+        if args.grad_clip_norm > 0:
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    trainable_params, max_norm=args.grad_clip_norm
+                ).item()
+            )
+        else:
+            grad_norm = 0.0
 
-            step += 1
-            if save_freq > 0 and step % save_freq == 0 and step < args.steps:
-                ckpt_dir = save_dir / f"step_{step}"
-                save_artifacts(ckpt_dir, policy, preprocessor, postprocessor)
-                print(f"[Save] Saved intermediate checkpoint to: {ckpt_dir}")
+        prev_scale = grad_scaler.get_scale() if grad_scaler.is_enabled() else None
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
+        if prev_scale is None or grad_scaler.get_scale() >= prev_scale:
+            scheduler.step()
 
-            if args.target_loss is not None and loss_val <= args.target_loss:
-                print(f"step: {step} loss: {loss_val:.4f} <= {args.target_loss}，达到目标 loss，停止训练并保存模型")
-                done = True
-                break
-            if step >= args.steps:
-                done = True
-                break
+        step_ms = (time.perf_counter() - t0) * 1000.0
+        ema_loss = (
+            accum_loss
+            if ema_loss is None
+            else (1.0 - ema_alpha) * ema_loss + ema_alpha * accum_loss
+        )
+        cur_lr = float(scheduler.get_last_lr()[0])
+        vram_mb = (
+            torch.cuda.max_memory_allocated(device) / (1024.0 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
 
-    # 5. 保存最终模型权重与 pre/post processor
+        if step == 1 or step % args.log_freq == 0 or step == args.steps:
+            metrics_logger.log(
+                step=step,
+                loss=accum_loss,
+                ema_loss=ema_loss,
+                lr=cur_lr,
+                grad_norm=grad_norm,
+                step_ms=step_ms,
+                vram_mb=vram_mb,
+            )
+            print(
+                f"step: {step:6d}/{args.steps} | loss: {accum_loss:.4f} | "
+                f"ema: {ema_loss:.4f} | lr: {cur_lr:.2e} | "
+                f"grad: {grad_norm:.2f} | {step_ms:.1f}ms | vram: {vram_mb:.0f}MB"
+            )
+
+        if step >= warmup_gate and (step % best_check_freq == 0 or step == args.steps):
+            if ema_loss < best_ema_loss:
+                best_ema_loss = ema_loss
+                save_artifacts(save_dir / "best_ema", policy, preprocessor, postprocessor)
+
+        if args.save_freq > 0 and step % args.save_freq == 0 and step < args.steps:
+            ckpt_dir = save_dir / f"step_{step}"
+            save_artifacts(ckpt_dir, policy, preprocessor, postprocessor)
+            print(f"[Save] Saved intermediate checkpoint to: {ckpt_dir}")
+
+        if args.target_loss is not None and step >= warmup_gate and ema_loss <= args.target_loss:
+            print(
+                f"[EarlyStop] step={step} ema_loss={ema_loss:.4f} <= {args.target_loss}，停止训练并保存模型"
+            )
+            break
+
+    # 5. 保存最终模型权重、处理器与训练曲线
     save_artifacts(save_dir, policy, preprocessor, postprocessor)
-    print(f"[Save] Saved PI0.5 policy & processors to: {save_dir}")
+    metrics_logger.save_plot(save_dir / "loss_curve.png")
+    print(f"[Save] Saved final PI0.5 policy & loss curve to: {save_dir}")
 
-    # 6. 离线开环推理评估
+    # 6. 在留出验证集上执行离线开环评估
     if args.enable_eval:
-        plot_path = save_dir / f"eval_episode_{args.eval_episode}.png" if args.eval_save_plot else None
-        evaluate_policy(
+        eval_eps = val_ep_ids if val_ep_ids else [args.eval_episode]
+        plot_name = (
+            f"eval_val_ep_{eval_eps[0]}.png"
+            if val_ep_ids
+            else f"eval_episode_{eval_eps[0]}.png"
+        )
+        plot_path = save_dir / plot_name if args.eval_save_plot else None
+        evaluate_heldout_mae(
             policy=policy,
-            dataset=dataset,
+            dataset=full_dataset,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             device=device,
-            episode_index=args.eval_episode,
-            show_plot=args.eval_show_plot,
+            episode_indices=eval_eps,
             save_plot_path=plot_path,
+            show_plot=args.eval_show_plot,
         )
     else:
         print("[Eval] 模型评估已关闭（可使用 --eval 参数开启）。")

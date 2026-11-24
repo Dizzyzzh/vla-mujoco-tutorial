@@ -598,7 +598,7 @@ def main() -> None:
                         if is_cuda:
                             torch.cuda.synchronize()
                         step_latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-                        action_np = action[0].detach().cpu().numpy()
+                        action_np = action[0].detach().float().cpu().numpy()
 
                     env.step(action_np)
                     for _ in range(substeps):

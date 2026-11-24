@@ -1,159 +1,237 @@
-import time  # 用于统计单帧策略推理耗时与 FPS（便于简历横向对比 ACT / SmolVLA / Pi0）
-import numpy as np  # 数值计算库，用于处理观测状态与输出动作数组
-from PIL import Image  # 图像缩放工具，将仿真相机画面统一调整到 256×256
-import torch  # PyTorch 深度学习推理框架
-import torchvision  # 提供 ToTensor() 图像张量转换（HWC uint8 [0,255] -> CHW float32 [0,1]）
+import argparse
+import time
+from pathlib import Path
 
-from lerobot.policies.act.configuration_act import ACTConfig  # ACT 策略配置类
-from lerobot.policies.act.modeling_act import ACTPolicy  # ACT 策略网络模型类
-from lerobot.policies.factory import make_pre_post_processors  # LeRobot 0.7.0 预处理/后处理器工厂函数
+import numpy as np
+import torch
+import torchvision
 
-from mujoco_env.y_env import SimpleEnv  # 多物体语言条件跨障分拣 MuJoCo 仿真环境
+from mujoco_env.y_env import SimpleEnv
 
-# ==================== 部署与评测配置区 ====================
-CKPT_PATH = "./ckpt/act_y.bak"  # 待部署的本地 ACT 权重目录（内含 model.safetensors 与 pre/post processor）
-XML_PATH = "./asset/example_scene_y.xml"  # MuJoCo 场景模型 XML 文件路径
-
-NUM_EPISODES = 10  # 连续评测的回合（episode）总数
-MAX_STEPS = 500  # 单个回合最大控制步数（20Hz 下 400 步 = 20 秒），超时判失败并进入下一回合
-SEED = None  # 随机种子：None 表示每回合随机生成物体位置；填整数（如 0）可固定初位复现
-
-# 任务与 OOD 评测配置（与 SimpleEnv.TASKS 对应）：
-#   0: Pick up the apple and place it in the blue tray.
-#   1: Pick up the apple and place it in the green tray.
-#   2: Pick up the orange and place it in the blue tray.
-#   3: Pick up the orange and place it in the green tray.
-#   None: 每回合随机抽取 4 条指令之一
-TASK_IDX = 0  # 默认评测任务索引（若训练的是单任务 ACT，请改为与训练集一致的任务号）
-INSTRUCTION_OVERRIDE = None  # 可选：自定义同义改写指令，不为 None 时覆盖 TASK_IDX
-OOD_DISTRACTOR = False  # True 时在抓取区加入红牛罐干扰物（测试抗干扰泛化）
-OOD_POSITION = False  # True 时扩大物体位置采样范围（测试空间外推泛化）
-
-# 时序集成（Temporal Ensemble）：每步重推理并加权平滑历史动作块，轨迹更顺滑
-# 若希望直接按训练时的 n_action_steps（如每 10 步推理一次）运行，将其设为 False
-USE_TEMPORAL_ENSEMBLE = False
-TEMPORAL_ENSEMBLE_COEFF = 0.01  # 指数加权系数（仅当 USE_TEMPORAL_ENSEMBLE=True 时生效）
-# ========================================================
-
-
-def load_act_policy(ckpt_path: str, device: str):
-    """离线加载本地 ACT 模型权重及其配套的输入预处理器与输出后处理器。"""
-    cfg = ACTConfig.from_pretrained(ckpt_path)  # 从本地 config.json 读取训练时的网络结构与特征配置
-    cfg.device = device  # 将推理设备更新为当前可用的 cuda / cpu
-    if USE_TEMPORAL_ENSEMBLE:  # 若启用时序集成平滑输出
-        cfg.n_action_steps = 1  # 时序集成要求每个控制步执行 1 步并重新融合预测块
-        cfg.temporal_ensemble_coeff = TEMPORAL_ENSEMBLE_COEFF  # 设置时序指数加权系数
-
-    policy = ACTPolicy.from_pretrained(ckpt_path, config=cfg)  # 从本地权重目录加载 ACT 参数
-    policy.to(device)  # 将模型参数与缓冲区迁移到目标设备
-    policy.eval()  # 切换为评估模式（关闭 Dropout，推理时不使用 CVAE 编码器分支）
-
-    # 直接从权重目录加载训练时保存的归一化/反归一化处理器，无需再读取原始数据集元信息
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg,  # 传入策略配置
-        pretrained_path=ckpt_path,  # 指定本地保存的 processor 配置与 safetensors 统计量路径
-        preprocessor_overrides={"device_processor": {"device": device}},  # 确保输入数据自动迁移到当前设备
+try:
+    from scripts.eval_benchmark import (
+        build_observation,
+        compose_dual_view_frame,
+        detect_policy_type,
+        load_policy_and_processors,
+        save_episode_video,
     )
-    return policy, preprocessor, postprocessor  # 返回模型与前后处理器三元组
+except ImportError:
+    from eval_benchmark import (
+        build_observation,
+        compose_dual_view_frame,
+        detect_policy_type,
+        load_policy_and_processors,
+        save_episode_video,
+    )
 
 
-def build_observation(env: SimpleEnv, policy: ACTPolicy, img_transform, device: str):
-    """采集当前仿真状态与相机画面，组装为 LeRobot 预处理器所需的观测字典。"""
-    state = env.get_joint_state()  # 读取 7 维状态：6 关节角 + 夹爪开合（与采集数据的 observation.state 一致）
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="单策略（ACT / SmolVLA / PI0.5）交互式闭环部署与自定义语言指令测试脚本"
+    )
+    parser.add_argument(
+        "--ckpt-path",
+        type=str,
+        default="./ckpt/smolvla_baseline/best_ema",
+        help="本地策略权重目录（含 config.json、model.safetensors 与 pre/post processor）",
+    )
+    parser.add_argument(
+        "--policy-type",
+        type=str,
+        choices=["auto", "act", "smolvla", "pi05"],
+        default="auto",
+        help="策略类型（默认 auto 从 config.json 自动识别）",
+    )
+    parser.add_argument(
+        "--xml-path",
+        type=str,
+        default="./asset/example_scene_y.xml",
+        help="MuJoCo 跨障分拣场景主 XML 文件路径",
+    )
+    parser.add_argument("--num-episodes", type=int, default=5, help="连续测试的回合数")
+    parser.add_argument("--max-steps", type=int, default=400, help="单回合最大控制步数（20Hz 下 400 步 = 20 秒）")
+    parser.add_argument("--seed", type=int, default=None, help="起始随机种子（默认 None 每回合随机初位）")
+    parser.add_argument(
+        "--task-idx",
+        type=int,
+        choices=[0, 1, 2, 3],
+        default=None,
+        help="固定测试标准任务编号（0~3）；不传且未指定 --instruction 时随机轮换",
+    )
+    parser.add_argument(
+        "--instruction",
+        type=str,
+        default=None,
+        help="可选：自由输入英文任务指令（如 'Grab the red fruit and drop it into the far container.'）",
+    )
+    parser.add_argument("--ood-distractor", action="store_true", help="在抓取区加入红牛罐干扰物")
+    parser.add_argument("--ood-position", action="store_true", help="开启扩展空间位置外推采样")
 
-    agent_img, wrist_img = env.grab_image()  # 从 MuJoCo 固定相机抓取主视角与腕部视角 RGB 图像
-    agent_tensor = img_transform(Image.fromarray(agent_img).resize((256, 256)))  # 缩放至 256×256 并转为 CHW [0,1] 张量
+    parser.add_argument("--device", type=str, default=None, help="推理计算设备（默认自动选择 cuda / cpu）")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["auto", "float32", "float16", "bfloat16"],
+        default="auto",
+        help="推理精度覆盖",
+    )
+    parser.add_argument("--n-action-steps", type=int, default=None, help="覆盖策略每次连续执行的动作步数")
+    parser.add_argument(
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=None,
+        help="为 ACT 启用时序集成平滑（例如 0.01，自动设 n_action_steps=1）",
+    )
+    parser.add_argument(
+        "--num-denoising-steps",
+        type=int,
+        default=None,
+        help="覆盖 SmolVLA / PI0.5 的 Flow Matching 去噪步数",
+    )
+    parser.add_argument("--compile", action="store_true", help="启用 torch.compile 加速推理")
+    parser.add_argument("--headless", action="store_true", help="无界面离屏运行（适合服务器环境快速部署验证）")
+    parser.add_argument("--save-video-dir", type=str, default=None, help="可选：保存部署过程双视角视频/GIF 的目录")
+    parser.add_argument(
+        "--video-format",
+        type=str,
+        choices=["mp4", "gif", "both"],
+        default="mp4",
+        help="视频导出格式（mp4 / gif / both）",
+    )
+    return parser.parse_args()
 
-    data = {  # 构造批次维度为 1 的观测字典
-        "observation.state": torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0),  # 形状 (1, 7)
-        "observation.image": agent_tensor.unsqueeze(0).to(device),  # 形状 (1, 3, 256, 256)
-    }
 
-    # 若当前权重训练时也使用了腕部相机，则自动附带 observation.wrist_image
-    if "observation.wrist_image" in policy.config.input_features:
-        wrist_tensor = img_transform(Image.fromarray(wrist_img).resize((256, 256)))  # 缩放并转张量
-        data["observation.wrist_image"] = wrist_tensor.unsqueeze(0).to(device)  # 形状 (1, 3, 256, 256)
+def main() -> None:
+    args = parse_args()
+    policy_type = detect_policy_type(args.ckpt_path) if args.policy_type == "auto" else args.policy_type
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    is_cuda = device.startswith("cuda")
+    use_autocast = is_cuda and args.dtype in ("float16", "bfloat16")
+    autocast_dtype = getattr(torch, args.dtype) if use_autocast else None
 
-    return data  # 返回待预处理的多模态观测字典
+    print(f"[Deploy] policy_type={policy_type} | device={device} | ckpt={args.ckpt_path}")
+    policy, preprocessor, postprocessor = load_policy_and_processors(
+        policy_type, args.ckpt_path, device, args
+    )
+    print(f"[Deploy] Input features: {list(policy.config.input_features.keys())}")
 
-
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"  # 优先使用 GPU 推理，无 GPU 时回退 CPU
-    print(f"Device: {device}")
-    print(f"Loading ACT checkpoint from: {CKPT_PATH}")
-
-    policy, preprocessor, postprocessor = load_act_policy(CKPT_PATH, device)  # 加载策略与处理器
-    print(f"Policy input features: {list(policy.config.input_features.keys())}")  # 打印策略实际使用的输入模态
-
-    # 初始化 MuJoCo 仿真环境，动作模式设为绝对关节角 'joint_angle'（与 ACT 输出的 7 维动作一致）
     env = SimpleEnv(
-        XML_PATH,
+        args.xml_path,
         action_type="joint_angle",
-        seed=SEED,
-        task_idx=TASK_IDX,
-        ood_distractor=OOD_DISTRACTOR,
-        ood_position=OOD_POSITION,
+        seed=args.seed,
+        task_idx=args.task_idx,
+        ood_distractor=args.ood_distractor,
+        ood_position=args.ood_position,
+        headless=args.headless,
+        verbose=not args.headless,
     )
+    substeps = int(round(1.0 / (env.env.dt * 20)))
+    img_transform = torchvision.transforms.ToTensor()
 
-    img_transform = torchvision.transforms.ToTensor()  # 图像数组转浮点张量工具
-    results = []  # 记录每个评测回合的分阶段结果与耗时
-    infer_times_ms = []  # 记录单步推理耗时（毫秒），用于统计平均延迟与 FPS
+    results: list[dict] = []
+    infer_times_ms: list[float] = []
 
     try:
-        for ep in range(NUM_EPISODES):  # 依次运行 NUM_EPISODES 个评测回合
-            if not env.env.is_viewer_alive():  # 若用户提前关闭可视化窗口则中止评测
-                print("Viewer closed by user, stopping evaluation.")
+        for ep in range(args.num_episodes):
+            if not args.headless and not env.env.is_viewer_alive():
+                print("[Info] Viewer closed by user, stopping deployment.")
                 break
 
-            ep_seed = None if SEED is None else SEED + ep  # 固定种子时每回合递增种子，便于复现不同初始布局
-            env.reset(  # 重置机械臂、随机物体初位与语言指令
+            ep_seed = None if args.seed is None else args.seed + ep
+            env.reset(
                 seed=ep_seed,
-                task_idx=None if INSTRUCTION_OVERRIDE else TASK_IDX,
-                instruction=INSTRUCTION_OVERRIDE,
-                ood_distractor=OOD_DISTRACTOR,
-                ood_position=OOD_POSITION,
+                task_idx=None if args.instruction else args.task_idx,
+                instruction=args.instruction,
+                ood_distractor=args.ood_distractor,
+                ood_position=args.ood_position,
             )
-            policy.reset()  # 清空 ACT 内部缓存的历史动作块与时序集成队列
+            policy.reset()
 
-            step = 0  # 当前回合控制步数计数器
-            success = False  # 本回合是否达成任务成功条件
+            steps_taken = 0
+            success = False
+            barrier_hit = False
+            video_frames: list[np.ndarray] = []
 
-            while env.env.is_viewer_alive() and step < MAX_STEPS:  # 在步数上限内以 20Hz 闭环推理控制
-                env.step_env()  # 推进一步底层 MuJoCo 物理仿真（500Hz）
-                if env.env.loop_every(HZ=20):  # 每 25 个物理步（20Hz）执行一次策略推理与动作下发
-                    data = build_observation(env, policy, img_transform, device)  # 采集当前观测
+            for step in range(args.max_steps):
+                if not args.headless and not env.env.is_viewer_alive():
+                    break
 
-                    t0 = time.perf_counter()  # 记录推理起始时间戳
-                    with torch.inference_mode():  # 关闭梯度计算以加速推理并降低显存占用
-                        batch = preprocessor(data)  # 对状态与图像做归一化并送入设备
-                        action = policy.select_action(batch)  # 调用 ACT 输出当前步（归一化）动作
-                        action = postprocessor(action)  # 反归一化还原真实关节角与夹爪指令尺度
-                    infer_times_ms.append((time.perf_counter() - t0) * 1000.0)  # 累计单步耗时（ms）
+                data, agent_img, wrist_img = build_observation(
+                    env, policy_type, policy, img_transform, device, include_side=not args.headless
+                )
 
-                    action_np = action[0].cpu().numpy()  # 转为形状 (7,) 的 NumPy 动作向量
-                    env.step(action_np)  # 下发 6 轴目标关节角 + 1 维夹爪指令到仿真环境
-                    env.render(idx=ep)  # 刷新渲染窗口并显示当前 Episode 编号与任务指令
-                    step += 1  # 控制步数加 1
+                if is_cuda:
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                with torch.inference_mode():
+                    inp_batch = preprocessor(data)
+                    if use_autocast:
+                        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                            action = policy.select_action(inp_batch)
+                    else:
+                        action = policy.select_action(inp_batch)
+                    action = postprocessor(action)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                infer_times_ms.append((time.perf_counter() - t0) * 1000.0)
 
-                    if env.check_success():  # 检查是否已完成全部任务条件（入盘、静止、松爪、抬手）
-                        success = True  # 标记本回合成功
-                        break  # 提前结束本回合进入下一回合
+                action_np = action[0].detach().float().cpu().numpy()
+                env.step(action_np)
+                for _ in range(substeps):
+                    env.step_env()
+                    if env.check_barrier_collision():
+                        barrier_hit = True
 
-            results.append({"success": success, "steps": step})  # 记录本回合结果
-            print(f"[Episode {ep + 1}/{NUM_EPISODES}] success={success} | steps={step}")
+                steps_taken = step + 1
+                if not args.headless:
+                    env.render(teleop=False, idx=ep)
+
+                done = env.check_success()
+                if args.save_video_dir is not None:
+                    video_frames.append(
+                        compose_dual_view_frame(
+                            agent_img=agent_img,
+                            wrist_img=wrist_img,
+                            suite_name="deploy",
+                            ep_idx=ep,
+                            step=steps_taken,
+                            max_steps=args.max_steps,
+                            instruction=env.instruction,
+                            status_text="SUCCESS" if done else "RUNNING",
+                            barrier_hit=barrier_hit,
+                        )
+                    )
+
+                if done:
+                    success = True
+                    break
+
+            if args.save_video_dir is not None and video_frames:
+                stem = f"deploy_{policy_type}_ep{ep:03d}_{'PASS' if success else 'FAIL'}"
+                saved = save_episode_video(
+                    video_frames, Path(args.save_video_dir), stem, args.video_format
+                )
+                print(f"  [Video] Saved: {', '.join(saved)}")
+
+            results.append({"success": success, "steps": steps_taken, "barrier_hit": barrier_hit})
+            print(
+                f"[Episode {ep + 1}/{args.num_episodes}] task='{env.instruction}' | "
+                f"success={success} | steps={steps_taken} | barrier_hit={barrier_hit}"
+            )
     finally:
-        env.env.close_viewer()  # 无论正常完成还是中断退出，均释放 MuJoCo 渲染窗口
+        env.close()
 
-    # 打印多回合汇总指标（可直接用于实验对比表）
     if results:
-        n = len(results)  # 实际完成的评测回合数
-        succ_rate = sum(r["success"] for r in results) / n * 100.0  # 端到端任务总成功率
-        avg_ms = float(np.mean(infer_times_ms)) if infer_times_ms else 0.0  # 平均单步推理耗时（ms）
-        fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0  # 等效推理帧率（Hz）
-        print("\n========== Evaluation Summary ==========")
-        print(f"Checkpoint : {CKPT_PATH}")
-        print(f"Episodes   : {n} (OOD distractor={OOD_DISTRACTOR}, OOD pos={OOD_POSITION})")
-        print(f"Success    : {succ_rate:.1f}% ({sum(r['success'] for r in results)}/{n})")
+        n = len(results)
+        succ_cnt = sum(1 for r in results if r["success"])
+        succ_rate = succ_cnt / n * 100.0
+        avg_ms = float(np.mean(infer_times_ms)) if infer_times_ms else 0.0
+        fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0
+        print("\n========== Deployment Summary ==========")
+        print(f"Policy     : {policy_type} ({args.ckpt_path})")
+        print(f"Episodes   : {n} (OOD distractor={args.ood_distractor}, OOD pos={args.ood_position})")
+        print(f"Success    : {succ_rate:.1f}% ({succ_cnt}/{n})")
         print(f"Inference  : {avg_ms:.2f} ms/step ({fps:.1f} FPS)")
         print("========================================")
 

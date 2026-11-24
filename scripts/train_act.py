@@ -41,9 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="训练 ACT 策略（支持 Warmup+Cosine、AMP、梯度累积、视觉增强与无泄露验证）"
     )
-    parser.add_argument("--repo-id", type=str, default="omy_pnp", help="数据集仓库标识名")
-    parser.add_argument("--dataset-root", type=str, default="./dataset/ACT_dataset", help="本地数据集根目录")
-    parser.add_argument("--output-dir", type=str, default="./ckpt/act_y", help="模型与日志保存目录")
+    parser.add_argument("--repo-id", type=str, default="omy_sorting_vla", help="数据集仓库标识名")
+    parser.add_argument("--dataset-root", type=str, default="./dataset/smolvla_dataset", help="本地数据集根目录")
+    parser.add_argument("--output-dir", type=str, default="./ckpt/act_baseline", help="模型与日志保存目录")
     parser.add_argument(
         "--resume-from",
         type=str,

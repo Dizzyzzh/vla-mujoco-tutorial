@@ -292,11 +292,11 @@ def evaluate_heldout_mae(
                 gt_action = (
                     batch["action"][:, 0, :] if batch["action"].ndim == 3 else batch["action"]
                 )
-                gt_actions.append(gt_action.cpu())
+                gt_actions.append(gt_action.float().cpu())
                 inp_batch = preprocessor(batch)
                 pred_action = policy.select_action(inp_batch)
                 pred_action = postprocessor(pred_action)
-                actions.append(pred_action.cpu())
+                actions.append(pred_action.float().cpu())
 
         pred_cat = torch.cat(actions, dim=0)
         gt_cat = torch.cat(gt_actions, dim=0)

@@ -1,13 +1,20 @@
-lerobot
-dataset
-demo_data_language
-ckpt
-# asset/objaverse/plate_11
-omy_pnp
-.venv
-wandb
-omy_pnp_language
+# Virtual environments & build artifacts
+.venv/
 __pycache__/
-.vscode/*
+*.py[cod]
 *.egg-info/
-eval_results
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Datasets, checkpoints & experiment outputs
+dataset/
+ckpt/
+eval_results/
+videos/
+wandb/
+
+# Editor settings
+.vscode/*
+.idea/

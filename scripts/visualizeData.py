@@ -1,59 +1,191 @@
-import numpy as np  # 导入 NumPy 数值计算库，用于图像维度转置与数组转换
-from torch.utils.data import DataLoader  # 导入 PyTorch DataLoader 按帧顺序读取数据集
-from lerobot.datasets.lerobot_dataset import LeRobotDataset  # 导入 LeRobot 数据集加载类
-from lerobot.datasets.utils import serialize_dict  # 导入统计字典序列化工具，将张量转为 JSON 可写格式
-from lerobot.utils.io_utils import write_json  # 导入 JSON 写入工具
+import argparse
+from pathlib import Path
 
-from mujoco_env.y_env import SimpleEnv  # 导入多物体语言条件跨障分拣仿真环境
+import numpy as np
+from torch.utils.data import DataLoader
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-DATAPATH = "./data/sorting_data_20261119_000000"  # 待回放质检的本地数据集目录（采集后替换为实际路径）
-REPO_NAME = "omy_sorting_vla"  # 数据集名称标识（需与 collectData.py 中 REPO_NAME 保持一致）
-EPISODE_INDEX = 0  # 指定要回放查看的 episode 编号（从 0 开始）
+from mujoco_env.y_env import SimpleEnv
 
-dataset = LeRobotDataset(REPO_NAME, root=DATAPATH, episodes=[EPISODE_INDEX])  # 仅加载指定编号的单条轨迹
-dataloader = DataLoader(dataset, batch_size=1, num_workers=0)  # 单帧单进程顺序读取，保证严格按时间步回放
+try:
+    from scripts.eval_benchmark import compose_dual_view_frame, save_episode_video
+except ImportError:
+    from eval_benchmark import compose_dual_view_frame, save_episode_video
 
-xml_path = "./asset/example_scene_y.xml"  # MuJoCo 跨障分拣场景 XML 文件路径
-PnPEnv = SimpleEnv(xml_path, action_type="joint_angle")  # 以绝对关节角模式初始化仿真环境用于动作回放
 
-step = 0  # 当前已回放的帧号计数器
-iter_dataloader = iter(dataloader)  # 获取 DataLoader 的初始迭代器
-PnPEnv.reset()  # 首次重置仿真环境
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="回放并质检 LeRobot 数据集轨迹（支持交互式 GUI 窗口与无界面物理复现/视频导出）"
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=str,
+        default="./dataset/smolvla_dataset",
+        help="待回放质检的本地数据集根目录",
+    )
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        default="omy_sorting_vla",
+        help="数据集仓库标识名（需与采集时保持一致）",
+    )
+    parser.add_argument("--episode", type=int, default=0, help="指定回放的 episode 编号（从 0 开始）")
+    parser.add_argument(
+        "--xml-path",
+        type=str,
+        default="./asset/example_scene_y.xml",
+        help="MuJoCo 跨障分拣场景主 XML 文件路径",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="无界面离屏回放单轮轨迹并输出物理复现成功/碰撞校验结果",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="GUI 模式下仅回放单轮即自动退出（默认循环播放直到关闭窗口）",
+    )
+    parser.add_argument(
+        "--save-video-dir",
+        type=str,
+        default=None,
+        help="可选：将回放过程导出为双视角标注视频/GIF 的保存目录",
+    )
+    parser.add_argument(
+        "--video-format",
+        type=str,
+        choices=["mp4", "gif", "both"],
+        default="mp4",
+        help="视频导出格式（mp4 / gif / both）",
+    )
+    return parser.parse_args()
 
-while PnPEnv.env.is_viewer_alive():  # 只要 MuJoCo 可视化窗口保持打开就持续循环回放
-    PnPEnv.step_env()  # 推进一步底层物理仿真（500Hz）
-    if PnPEnv.env.loop_every(HZ=20):  # 按与采集一致的 20Hz 频率逐帧回放动作
-        data = next(iter_dataloader)  # 读取当前时间步的数据字典
-        if step == 0:  # 在每轮回放的第 0 帧恢复录制时的物体初位与语言指令
-            obj_init = data["obj_init"][0].numpy()  # 提取 9 维物体初始坐标向量
-            if len(obj_init) >= 9:  # 新版跨障分拣数据集：含苹果、橙子、红牛罐共 9 维坐标
-                PnPEnv.set_obj_pose(obj_init[:3], obj_init[3:6], obj_init[6:9])  # 精确还原 3 个物体初位
-            else:  # 兼容仅含前两个物体坐标的 6 维旧格式
-                PnPEnv.set_obj_pose(obj_init[:3], obj_init[3:6])  # 仅还原苹果与橙子，红牛罐停放场外
-            if "task" in data:  # 若数据帧中包含自然语言任务描述
-                # DataLoader batch=1 时字符串会被包装成长度为 1 的列表/元组，这里解包为纯字符串
-                task_str = (
-                    data["task"][0]
-                    if isinstance(data["task"], (list, tuple))
-                    else str(data["task"])
+
+def restore_episode_initial_state(env: SimpleEnv, first_frame: dict) -> None:
+    """在回放第 0 帧恢复录制时的物体初位与语言指令。"""
+    obj_init = first_frame["obj_init"][0].numpy()
+    if len(obj_init) >= 9:
+        env.set_obj_pose(obj_init[:3], obj_init[3:6], obj_init[6:9])
+    else:
+        env.set_obj_pose(obj_init[:3], obj_init[3:6])
+
+    if "task" in first_frame:
+        task_val = first_frame["task"]
+        task_str = task_val[0] if isinstance(task_val, (list, tuple)) else str(task_val)
+        env.set_instruction(given=task_str)
+
+
+def run_headless_replay(args: argparse.Namespace, dataset: LeRobotDataset) -> None:
+    """无界面精确按帧推进动作，验证数据集物理复现一致性并按需导出视频。"""
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=0, shuffle=False)
+    env = SimpleEnv(
+        args.xml_path,
+        action_type="joint_angle",
+        headless=True,
+        verbose=False,
+    )
+    substeps = int(round(1.0 / (env.env.dt * 20)))
+    total_frames = len(dataset)
+    barrier_hit = False
+    video_frames: list[np.ndarray] = []
+
+    try:
+        env.reset()
+        for step, data in enumerate(dataloader):
+            if step == 0:
+                restore_episode_initial_state(env, data)
+
+            action = data["action"][0].numpy()
+            env.step(action)
+            for _ in range(substeps):
+                env.step_env()
+                if env.check_barrier_collision():
+                    barrier_hit = True
+
+            if args.save_video_dir is not None:
+                agent_img, wrist_img = env.grab_image(include_side=False)
+                status = "SUCCESS" if env.check_success() else "REPLAY"
+                video_frames.append(
+                    compose_dual_view_frame(
+                        agent_img=agent_img,
+                        wrist_img=wrist_img,
+                        suite_name="replay",
+                        ep_idx=args.episode,
+                        step=step + 1,
+                        max_steps=total_frames,
+                        instruction=env.instruction,
+                        status_text=status,
+                        barrier_hit=barrier_hit,
+                    )
                 )
-                PnPEnv.set_instruction(given=task_str)  # 将当前任务指令同步显示到渲染窗口
 
-        action = data["action"].numpy()  # 读取本帧记录的 7 维关节+夹爪动作（形状 (1, 7)）
-        PnPEnv.step(action[0])  # 将动作指令下发到仿真机械臂复现动作轨迹
+        replay_success = env.check_success()
+        print(
+            f"[Replay Check] episode={args.episode} | frames={total_frames} | "
+            f"task='{env.instruction}' | replay_success={replay_success} | barrier_hit={barrier_hit}"
+        )
 
-        # 提取数据集中实际保存的图像（浮点 [0,1] CHW）并转回 uint8 HWC，叠加到右上/右下小窗核对画质
-        PnPEnv.rgb_agent = (data["observation.image"][0].numpy() * 255).astype(np.uint8)  # 还原主视角像素值到 [0, 255]
-        PnPEnv.rgb_ego = (data["observation.wrist_image"][0].numpy() * 255).astype(np.uint8)  # 还原腕部视角像素值
-        PnPEnv.rgb_agent = np.transpose(PnPEnv.rgb_agent, (1, 2, 0))  # 通道维从 (3, 256, 256) 转为 (256, 256, 3)
-        PnPEnv.rgb_ego = np.transpose(PnPEnv.rgb_ego, (1, 2, 0))  # 通道维从 (3, 256, 256) 转为 (256, 256, 3)
-        PnPEnv.rgb_side = np.zeros((480, 640, 3), dtype=np.uint8)  # 回放模式下侧视角用全黑占位图即可
-        PnPEnv.render(idx=EPISODE_INDEX)  # 刷新窗口画面并标注当前回放的 Episode 编号与任务指令
-        step += 1  # 帧号加 1
+        if args.save_video_dir is not None and video_frames:
+            stem = f"replay_ep{args.episode:03d}_{'PASS' if replay_success else 'FAIL'}"
+            saved = save_episode_video(
+                video_frames, Path(args.save_video_dir), stem, args.video_format
+            )
+            print(f"[Video] Saved replay video: {', '.join(saved)}")
+    finally:
+        env.close()
 
-        if step == len(dataset):  # 若当前 episode 已播到最后一帧
-            iter_dataloader = iter(dataloader)  # 重建迭代器从头循环播放
-            PnPEnv.reset()  # 重置机械臂与仿真环境
-            step = 0  # 帧号归零
 
-PnPEnv.env.close_viewer()  # 用户关闭窗口后释放 MuJoCo 渲染器资源
+def run_gui_replay(args: argparse.Namespace, dataset: LeRobotDataset) -> None:
+    """交互式 MuJoCo 窗口循环回放数据集动作，并在右侧叠加数据集中保存的原始相机帧。"""
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=0, shuffle=False)
+    env = SimpleEnv(args.xml_path, action_type="joint_angle")
+    total_frames = len(dataset)
+    step = 0
+    iter_dataloader = iter(dataloader)
+    env.reset()
+
+    try:
+        while env.env.is_viewer_alive():
+            env.step_env()
+            if env.env.loop_every(HZ=20):
+                data = next(iter_dataloader)
+                if step == 0:
+                    restore_episode_initial_state(env, data)
+
+                action = data["action"][0].numpy()
+                env.step(action)
+
+                rgb_agent = (data["observation.image"][0].numpy() * 255).astype(np.uint8)
+                rgb_ego = (data["observation.wrist_image"][0].numpy() * 255).astype(np.uint8)
+                env.rgb_agent = np.transpose(rgb_agent, (1, 2, 0))
+                env.rgb_ego = np.transpose(rgb_ego, (1, 2, 0))
+                env.rgb_side = np.zeros((480, 640, 3), dtype=np.uint8)
+                env.render(idx=args.episode)
+                step += 1
+
+                if step == total_frames:
+                    print(
+                        f"[Replay] Finished episode {args.episode} ({total_frames} frames) | "
+                        f"success={env.check_success()}"
+                    )
+                    if args.once:
+                        break
+                    iter_dataloader = iter(dataloader)
+                    env.reset()
+                    step = 0
+    finally:
+        env.close()
+
+
+def main() -> None:
+    args = parse_args()
+    dataset = LeRobotDataset(args.repo_id, root=args.dataset_root, episodes=[args.episode])
+    if args.headless:
+        run_headless_replay(args, dataset)
+    else:
+        run_gui_replay(args, dataset)
+
+
+if __name__ == "__main__":
+    main()
