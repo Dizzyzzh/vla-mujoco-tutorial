@@ -7,11 +7,11 @@ numpy>=1.26.0
 scipy>=1.11.0
 matplotlib>=3.8.0
 
-# Deep learning & VLA policies (install matching CUDA wheel for torch/torchvision first if needed)
+# Deep learning & SmolVLA
 torch>=2.6.0
 torchvision>=0.21.0
 safetensors>=0.5.0
 datasets>=3.4.0
 transformers>=4.50.0
 accelerate>=1.2.0
-lerobot[smolvla,pi]>=0.7.0
+lerobot[smolvla]>=0.7.0

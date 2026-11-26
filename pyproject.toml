@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vla-mujoco-sorting"
 version = "0.2.0"
-description = "Language-Conditioned 3D Obstacle-Crossing Manipulation & OOD Evaluation Benchmark with MuJoCo and LeRobot"
+description = "Language-Conditioned 3D Obstacle-Crossing Manipulation & OOD Evaluation Benchmark with MuJoCo and SmolVLA"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 vla = [
-    "lerobot[smolvla,pi]>=0.7.0",
+    "lerobot[smolvla]>=0.7.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -35,14 +35,11 @@ dev = [
 ]
 
 [project.scripts]
-vla-auto-collect = "scripts.auto_collect:main"
-vla-teleop-collect = "scripts.collectData:main"
+vla-collect = "scripts.collectData:main"
 vla-replay = "scripts.visualizeData:main"
-vla-train-act = "scripts.train_act:main"
-vla-train-smolvla = "scripts.train_smolvla:main"
-vla-train-pi05 = "scripts.train_pi05:main"
-vla-deploy = "scripts.deploy:main"
+vla-train = "scripts.train_smolvla:main"
 vla-eval = "scripts.eval_benchmark:main"
+vla-deploy = "scripts.deploy:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
